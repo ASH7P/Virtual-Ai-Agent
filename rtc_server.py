@@ -247,51 +247,79 @@ async def offer(request: web.Request):
 
     whisper.on_eos = on_eos
 
-    @pc.on("track")
-    def on_track(track):
-        if track.kind != "audio":
-            return
-    
-        LOG.info("Browser audio track received")
-    
-        async def forward_audio_to_whisper():
-            first = True
-            while True:
-                try:
-                    frame = await track.recv()
-                except Exception as e:
-                    LOG.info(f"audio recv ended: {e}")
-                    break
-        
-                # Get samples as ndarray (dtype follows frame.format: s16 -> int16, flt -> float32, etc.)
-                arr = frame.to_ndarray()                 # shape: (channels, samples) or (samples,)
-                # Mono: take first channel if multi-channel
-                if arr.ndim == 2:
-                    arr = arr[0, :]
-        
-                # Normalize to int16
-                if arr.dtype == np.int16:
-                    pcm_s16 = arr
-                elif arr.dtype == np.int32:
-                    # downscale to int16
-                    pcm_s16 = (arr >> 16).astype(np.int16)
-                elif arr.dtype == np.float32:
-                    pcm_s16 = np.clip(arr * 32768.0, -32768, 32767).astype(np.int16)
-                elif arr.dtype == np.float64:
-                    pcm_s16 = np.clip(arr * 32768.0, -32768, 32767).astype(np.int16)
+@pc.on("track")
+def on_track(track):
+    if track.kind != "audio":
+        return
+
+    LOG.info("Browser audio track received")
+
+    async def forward_audio_to_whisper():
+        frames = 0
+        sent_bytes = 0
+        sr_last = None
+
+        while True:
+            try:
+                frame = await track.recv()
+            except Exception as e:
+                LOG.info(f"[ingest] audio recv ended: {e}")
+                break
+
+            # PyAV -> ndarray
+            arr = frame.to_ndarray()  # dtype varies (int16/32, float32/64); shape can be (samples, ch) or (ch, samples)
+
+            # shape to mono
+            if arr.ndim == 2:
+                # Heuristic: pick first channel regardless of orientation
+                # If shape == (channels, samples)
+                if hasattr(frame, "layout") and getattr(frame.layout, "channels", None) and arr.shape[0] == frame.layout.channels:
+                    mono = arr[0, :]
                 else:
-                    # fallback
-                    pcm_s16 = arr.astype(np.int16)
-        
-                sr_in = frame.sample_rate or 48000
-                if first:
-                    LOG.info(f"Incoming audio: sr_in={sr_in}, dtype={arr.dtype}, samples={arr.shape[0]}")
-                    first = False
-        
-                # Resample to 16k and send as float32 mono (what your Whisper server expects)
-                pcm16k = resample_linear_int16(pcm_s16.reshape(-1), sr_in, 16000)
-                pcmf32 = (pcm16k.astype(np.float32) / 32768.0).tobytes()
+                    # assume (samples, channels)
+                    mono = arr[:, 0]
+            else:
+                mono = arr
+
+            # dtype -> int16
+            if mono.dtype == np.int16:
+                pcm_s16 = mono
+            elif mono.dtype == np.int32:
+                pcm_s16 = (mono >> 16).astype(np.int16)
+            elif mono.dtype == np.float32:
+                pcm_s16 = np.clip(mono * 32768.0, -32768, 32767).astype(np.int16)
+            elif mono.dtype == np.float64:
+                pcm_s16 = np.clip(mono * 32768.0, -32768, 32767).astype(np.int16)
+            else:
+                pcm_s16 = mono.astype(np.int16, copy=False)
+
+            # sample rate
+            sr_in = getattr(frame, "sample_rate", None) or 48000
+
+            # resample -> 16k
+            pcm16k = resample_linear_int16(pcm_s16.reshape(-1), sr_in, 16000)
+
+            # float32 LE bytes (what your Whisper server expects over WS)
+            pcmf32 = (pcm16k.astype(np.float32) / 32768.0).tobytes()
+
+            try:
                 await whisper.send_audio(pcmf32)
+                sent_bytes += len(pcmf32)
+                frames += 1
+            except Exception as e:
+                LOG.error(f"[ingest] whisper send error: {e}")
+                break
+
+            # periodic debug
+            if frames % 20 == 0:  # ~every ~0.4–0.8s depending on frame size
+                if sr_last != sr_in:
+                    LOG.info(f"[ingest] sr_in={sr_in}, dtype={mono.dtype}, chunk={len(pcmf32)} bytes")
+                    sr_last = sr_in
+                else:
+                    LOG.info(f"[ingest] tx≈{sent_bytes/1024:.1f} KiB")
+
+    asyncio.create_task(forward_audio_to_whisper())
+
 
 
     @pc.on("connectionstatechange")
@@ -385,6 +413,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
