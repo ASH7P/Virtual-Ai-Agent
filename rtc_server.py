@@ -132,22 +132,24 @@ class WhisperBridge:
                 continue
             if msg.get("uid") != self.uid:
                 continue
-
+    
             if "status" in msg:
                 LOG.info(f"[whisper] {msg['status']}: {msg.get('message','')}")
                 continue
-
+    
             if msg.get("message") == "SERVER_READY":
                 LOG.info("[whisper] ready")
                 continue
-
+    
             if "segments" in msg:
                 segs = msg["segments"]
-                # keep last few pieces like your client
                 last = [s.get("text", "").strip() for s in segs[-4:]]
                 self.current_text = last
+                # NEW: quick peek at last partial so you see signs of life
+                if last and last[-1]:
+                    LOG.info(f"[whisper] partial: {last[-1]}")
                 continue
-
+    
             if msg.get("message") == "EOS":
                 text = " ".join(self.current_text).strip()
                 LOG.info(f"[whisper] EOS: {text}")
@@ -157,6 +159,7 @@ class WhisperBridge:
                     except Exception as e:
                         LOG.exception(f"on_eos failed: {e}")
                 self.current_text = []
+
 
     async def send_audio(self, pcm_f32_mono_16k: bytes):
         if self.ws is None:
@@ -413,6 +416,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
