@@ -61,7 +61,7 @@ class WhisperBridge:
         self.ws = await websockets.connect(self.url, max_size=10*1024*1024)
         opts = {
             "uid": self.uid,
-            "language": None,
+            "language": "ar",
             "task": "transcribe",
             "model": "small",
             "use_vad": True,
@@ -237,4 +237,5 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
 
