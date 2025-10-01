@@ -85,8 +85,8 @@ class ServeClientBase(object):
                 self.clip_audio_if_no_valid_segment()
 
             input_bytes, duration = self.get_audio_chunk_for_processing()
-            if duration < 1.0:
-                time.sleep(0.1)     # wait for audio chunks to arrive
+            if duration < 0.25:
+                time.sleep(0.02)     # wait for audio chunks to arrive
                 continue
             try:
                 input_sample = input_bytes.copy()
@@ -94,7 +94,7 @@ class ServeClientBase(object):
 
                 if result is None or self.language is None:
                     self.timestamp_offset += duration
-                    time.sleep(0.25)    # wait for voice activity, result is None when no voice activity
+                    time.sleep(0.02)    # wait for voice activity, result is None when no voice activity
                     continue
                 self.handle_transcription_output(result, duration)
 
@@ -360,7 +360,7 @@ class ServeClientBase(object):
             # audio thats not yet transcribed so, capturing the time when it was repeated for the first time
             if self.end_time_for_same_output is None:
                 self.end_time_for_same_output = self.get_segment_end(segments[-1])
-            time.sleep(0.1)  # wait briefly for any new voice activity
+            time.sleep(0.02)  # wait briefly for any new voice activity
         else:
             self.same_output_count = 0
             self.end_time_for_same_output = None

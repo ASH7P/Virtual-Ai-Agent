@@ -8,14 +8,14 @@ import warnings
 
 class VoiceActivityDetection():
 
-    def __init__(self, force_onnx_cpu=True):
+    def __init__(self, force_onnx_cpu=False):
         path = self.download()
 
         opts = onnxruntime.SessionOptions()
         opts.log_severity_level = 3
 
-        opts.inter_op_num_threads = 1
-        opts.intra_op_num_threads = 1
+        opts.inter_op_num_threads = 1 # or 2 (test with cpu)
+        opts.intra_op_num_threads = 1 # or 2 (test with cpu)
 
         if force_onnx_cpu and 'CPUExecutionProvider' in onnxruntime.get_available_providers():
             self.session = onnxruntime.InferenceSession(path, providers=['CPUExecutionProvider'], sess_options=opts)
