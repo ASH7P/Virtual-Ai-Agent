@@ -48,8 +48,13 @@ class PCM24Player {
   constructor(ctx){
     this.ctx = ctx;
     this.started = false;
-    this.playHead = 0;              // scheduled time in AudioContext seconds
+    this.playHead = 0;
     this.sampleRateIn = 24000;
+
+    // Jitter buffer settings
+    this.initialLead = 0.25; // start 250 ms in the future
+    this.minLead     = 0.08; // keep at least 80 ms scheduled ahead
+
     this.gain = this.ctx.createGain();
     this.gain.gain.value = 1.0;
     this.gain.connect(this.ctx.destination);
@@ -57,12 +62,13 @@ class PCM24Player {
   async init(){
     if (this.started) return;
     this.started = true;
-    this.playHead = this.ctx.currentTime;
+    // Start with a little lead to avoid first-chunk underrun
+    this.playHead = this.ctx.currentTime + this.initialLead;
   }
   async pushInt16Mono24k(bytes){
     await this.init();
 
-    // Detect and strip minimal WAV header if present (RIFF/WAVE)
+    // --- strip minimal WAV header if present ---
     const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
     let off = 0;
     if (bytes.byteLength >= 44 &&
@@ -72,34 +78,35 @@ class PCM24Player {
       while (p + 8 <= bytes.byteLength) {
         const id = view.getUint32(p, false);
         const sz = view.getUint32(p+4, true);
-        if (id === 0x64617461) { // 'data'
-          off = p + 8;
-          break;
-        }
+        if (id === 0x64617461) { off = p + 8; break; } // 'data'
         p += 8 + sz;
       }
     }
     const byteLen = bytes.byteLength - off;
     if (byteLen <= 0) return;
 
-    // int16 -> float32 [-1,1]
+    // int16 -> float32
     const s16 = new Int16Array(bytes.buffer, bytes.byteOffset + off, Math.floor(byteLen/2));
     const len = s16.length;
     const f32 = new Float32Array(len);
     for (let i=0;i<len;i++) f32[i] = Math.max(-1, Math.min(1, s16[i] / 32768));
 
-    // Queue buffer at 24k; browser resamples to device rate automatically
+    // Put into a 24 kHz AudioBuffer (browser will resample)
     const buf = this.ctx.createBuffer(1, len, this.sampleRateIn);
     buf.copyToChannel(f32, 0, 0);
+
+    // Maintain a small lead ahead of current time
+    const now = this.ctx.currentTime;
+    if (this.playHead < now + this.minLead) {
+      this.playHead = now + this.minLead;
+    }
 
     const src = this.ctx.createBufferSource();
     src.buffer = buf;
     src.connect(this.gain);
 
-    const now = this.ctx.currentTime;
-    const startAt = Math.max(now, this.playHead);
-    try { src.start(startAt); } catch(e){ console.error('src.start failed', e); }
-    this.playHead = startAt + buf.duration;
+    try { src.start(this.playHead); } catch(e){ console.error('src.start failed', e); }
+    this.playHead += buf.duration;
 
     src.onended = () => { try { src.disconnect(); } catch{} };
   }
