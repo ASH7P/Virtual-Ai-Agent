@@ -6,7 +6,13 @@ import asyncio
 import logging
 import numpy as np
 from aiohttp import web
-from aiortc import RTCPeerConnection, RTCSessionDescription, MediaStreamTrack, RTCConfiguration, RTCIceServer
+from aiortc import (
+    RTCPeerConnection,
+    RTCSessionDescription,
+    MediaStreamTrack,
+    RTCConfiguration,
+    RTCIceServer,
+)
 from av.audio.frame import AudioFrame
 import websockets
 
@@ -15,20 +21,25 @@ from openai import AsyncAzureOpenAI
 # === your text agent (unchanged) ===
 # We ONLY import LLM_Client to get the text reply. We do not touch its TTS-to-speaker code.
 from Ai_engine import LLM_Client
-from prompts import SYSTEM_PROMPT,TTS_INSTRUCTIONS
+from prompts import SYSTEM_PROMPT as _SYS_PROMPT, TTS_INSTRUCTIONS
+
 logging.basicConfig(level=logging.INFO)
 LOG = logging.getLogger("rtc_gateway")
 
 # --------- ENV / CONFIG ----------
 WHISPER_WS_URL = os.getenv("WHISPER_WS_URL", "ws://127.0.0.1:9090")
-SYSTEM_PROMPT = SYSTEM_PROMPT
+SYSTEM_PROMPT = _SYS_PROMPT  # avoid name shadowing
+
 # Azure creds read here only for TTS (your LLM_Client will read its own envs for chat)
 AZURE_OPENAI_ENDPOINT = os.getenv("ENDPOINT_URL", "https://ttsmodel3.openai.azure.com/")
-AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY", "2nnLldWRJFxVegf69V94gzqF2QzlkgYaaISUiCl2bLt6YHRDFRqZJQQJ99BIACHYHv6XJ3w3AAABACOG0eBS")
+AZURE_OPENAI_API_KEY = os.getenv(
+    "AZURE_OPENAI_API_KEY",
+    "2nnLldWRJFxVegf69V94gzqF2QzlkgYaaISUiCl2bLt6YHRDFRqZJQQJ99BIACHYHv6XJ3w3AAABACOG0eBS",
+)
 AZURE_TTS_MODEL = os.getenv("AZURE_TTS_DEPLOYMENT", "gpt-4o-mini-tts")
 AZURE_TTS_VOICE = os.getenv("AZURE_TTS_VOICE", "onyx")
 
-# ICE / TURN for internet clients (set these on Paperspace)
+# ICE / TURN
 TURN_URL = os.getenv("TURN_URL", "")          # e.g. "turn:turn.yourdomain.com:3478"
 TURN_USER = os.getenv("TURN_USER", "")        # e.g. "webrtc"
 TURN_PASS = os.getenv("TURN_PASS", "")        # e.g. strong password
@@ -38,7 +49,7 @@ STUN_URL = os.getenv("STUN_URL", "stun:stun.l.google.com:19302")
 RTC_HOST = os.getenv("RTC_HOST", "0.0.0.0")
 RTC_PORT = int(os.getenv("RTC_PORT", "8080"))
 
-# HTTPS (recommended behind Nginx/Caddy—serve aiohttp over HTTP and proxy TLS)
+# HTTPS (optional; usually put TLS on a reverse proxy instead)
 ENABLE_SSL = os.getenv("ENABLE_SSL", "false").lower() == "true"
 SSL_CERT = os.getenv("SSL_CERT", "")
 SSL_KEY = os.getenv("SSL_KEY", "")
@@ -75,27 +86,6 @@ class OutboundAudioTrack(MediaStreamTrack):
         frame.planes[0].update(samples.tobytes())
         return frame
 
-# --------- inbound wrapper: Browser mic -> Whisper WS ----------
-class BrowserMicToWhisper(MediaStreamTrack):
-    kind = "audio"
-    def __init__(self, src_track: MediaStreamTrack, ws_send):
-        super().__init__()
-        self._src = src_track
-        self._ws_send = ws_send  # async fn(bytes) sending float32 mono @16k
-
-    async def recv(self) -> AudioFrame:
-        frame: AudioFrame = await self._src.recv()
-        # convert to mono int16
-        pcm_s16 = frame.to_ndarray(format="s16").reshape(-1)
-        if frame.layout.name != "mono":
-            pcm_s16 = pcm_s16[::frame.layout.channels]
-        # resample to 16k and convert to float32 (expected by your whisper server)
-        pcm_16k = resample_linear_int16(pcm_s16, frame.sample_rate, 16000)
-        pcm_f32 = float32_from_int16(pcm_16k).tobytes()
-        # fire-and-forget push to whisper
-        asyncio.create_task(self._ws_send(pcm_f32))
-        return frame
-
 # --------- Whisper websocket bridge ----------
 class WhisperBridge:
     def __init__(self, ws_url: str):
@@ -103,9 +93,7 @@ class WhisperBridge:
         self.ws = None
         self.uid = "rtc-bridge"
         self.current_text = []
-
-        # Hook assigned by the session to handle EOS: async def on_eos(full_text): ...
-        self.on_eos = None
+        self.on_eos = None  # async def on_eos(text: str): ...
 
     async def connect(self):
         self.ws = await websockets.connect(self.ws_url)
@@ -132,24 +120,23 @@ class WhisperBridge:
                 continue
             if msg.get("uid") != self.uid:
                 continue
-    
+
             if "status" in msg:
                 LOG.info(f"[whisper] {msg['status']}: {msg.get('message','')}")
                 continue
-    
+
             if msg.get("message") == "SERVER_READY":
                 LOG.info("[whisper] ready")
                 continue
-    
+
             if "segments" in msg:
                 segs = msg["segments"]
                 last = [s.get("text", "").strip() for s in segs[-4:]]
                 self.current_text = last
-                # NEW: quick peek at last partial so you see signs of life
                 if last and last[-1]:
                     LOG.info(f"[whisper] partial: {last[-1]}")
                 continue
-    
+
             if msg.get("message") == "EOS":
                 text = " ".join(self.current_text).strip()
                 LOG.info(f"[whisper] EOS: {text}")
@@ -159,7 +146,6 @@ class WhisperBridge:
                     except Exception as e:
                         LOG.exception(f"on_eos failed: {e}")
                 self.current_text = []
-
 
     async def send_audio(self, pcm_f32_mono_16k: bytes):
         if self.ws is None:
@@ -215,7 +201,6 @@ def _rtc_config():
     ice_servers = []
     if STUN_URL:
         ice_servers.append(RTCIceServer(urls=[STUN_URL]))
-    # TURN strongly recommended for Paperspace (NAT)
     if TURN_URL and TURN_USER and TURN_PASS:
         ice_servers.append(RTCIceServer(urls=[TURN_URL], username=TURN_USER, credential=TURN_PASS))
     return RTCConfiguration(iceServers=ice_servers)
@@ -250,80 +235,76 @@ async def offer(request: web.Request):
 
     whisper.on_eos = on_eos
 
-@pc.on("track")
-def on_track(track):
-    if track.kind != "audio":
-        return
+    @pc.on("track")
+    def on_track(track):
+        if track.kind != "audio":
+            return
 
-    LOG.info("Browser audio track received")
+        LOG.info("Browser audio track received")
 
-    async def forward_audio_to_whisper():
-        frames = 0
-        sent_bytes = 0
-        sr_last = None
+        async def forward_audio_to_whisper():
+            frames = 0
+            sent_bytes = 0
+            sr_last = None
 
-        while True:
-            try:
-                frame = await track.recv()
-            except Exception as e:
-                LOG.info(f"[ingest] audio recv ended: {e}")
-                break
+            while True:
+                try:
+                    frame = await track.recv()
+                except Exception as e:
+                    LOG.info(f"[ingest] audio recv ended: {e}")
+                    break
 
-            # PyAV -> ndarray
-            arr = frame.to_ndarray()  # dtype varies (int16/32, float32/64); shape can be (samples, ch) or (ch, samples)
+                # PyAV -> ndarray (dtype varies; shape can be (samples, ch) or (ch, samples))
+                arr = frame.to_ndarray()
 
-            # shape to mono
-            if arr.ndim == 2:
-                # Heuristic: pick first channel regardless of orientation
-                # If shape == (channels, samples)
-                if hasattr(frame, "layout") and getattr(frame.layout, "channels", None) and arr.shape[0] == frame.layout.channels:
-                    mono = arr[0, :]
+                # shape to mono
+                if arr.ndim == 2:
+                    # try to detect orientation; fallback to first axis
+                    if hasattr(frame, "layout") and getattr(frame.layout, "channels", None) and arr.shape[0] == frame.layout.channels:
+                        mono = arr[0, :]
+                    else:
+                        mono = arr[:, 0]
                 else:
-                    # assume (samples, channels)
-                    mono = arr[:, 0]
-            else:
-                mono = arr
+                    mono = arr
 
-            # dtype -> int16
-            if mono.dtype == np.int16:
-                pcm_s16 = mono
-            elif mono.dtype == np.int32:
-                pcm_s16 = (mono >> 16).astype(np.int16)
-            elif mono.dtype == np.float32:
-                pcm_s16 = np.clip(mono * 32768.0, -32768, 32767).astype(np.int16)
-            elif mono.dtype == np.float64:
-                pcm_s16 = np.clip(mono * 32768.0, -32768, 32767).astype(np.int16)
-            else:
-                pcm_s16 = mono.astype(np.int16, copy=False)
-
-            # sample rate
-            sr_in = getattr(frame, "sample_rate", None) or 48000
-
-            # resample -> 16k
-            pcm16k = resample_linear_int16(pcm_s16.reshape(-1), sr_in, 16000)
-
-            # float32 LE bytes (what your Whisper server expects over WS)
-            pcmf32 = (pcm16k.astype(np.float32) / 32768.0).tobytes()
-
-            try:
-                await whisper.send_audio(pcmf32)
-                sent_bytes += len(pcmf32)
-                frames += 1
-            except Exception as e:
-                LOG.error(f"[ingest] whisper send error: {e}")
-                break
-
-            # periodic debug
-            if frames % 20 == 0:  # ~every ~0.4–0.8s depending on frame size
-                if sr_last != sr_in:
-                    LOG.info(f"[ingest] sr_in={sr_in}, dtype={mono.dtype}, chunk={len(pcmf32)} bytes")
-                    sr_last = sr_in
+                # dtype -> int16
+                if mono.dtype == np.int16:
+                    pcm_s16 = mono
+                elif mono.dtype == np.int32:
+                    pcm_s16 = (mono >> 16).astype(np.int16)
+                elif mono.dtype == np.float32:
+                    pcm_s16 = np.clip(mono * 32768.0, -32768, 32767).astype(np.int16)
+                elif mono.dtype == np.float64:
+                    pcm_s16 = np.clip(mono * 32768.0, -32768, 32767).astype(np.int16)
                 else:
-                    LOG.info(f"[ingest] tx≈{sent_bytes/1024:.1f} KiB")
+                    pcm_s16 = mono.astype(np.int16, copy=False)
 
-    asyncio.create_task(forward_audio_to_whisper())
+                # sample rate
+                sr_in = getattr(frame, "sample_rate", None) or 48000
 
+                # resample -> 16k
+                pcm16k = resample_linear_int16(pcm_s16.reshape(-1), sr_in, 16000)
 
+                # float32 LE bytes (what your Whisper server expects over WS)
+                pcmf32 = (pcm16k.astype(np.float32) / 32768.0).tobytes()
+
+                try:
+                    await whisper.send_audio(pcmf32)
+                    sent_bytes += len(pcmf32)
+                    frames += 1
+                except Exception as e:
+                    LOG.error(f"[ingest] whisper send error: {e}")
+                    break
+
+                # periodic debug
+                if frames % 20 == 0:
+                    if sr_last != sr_in:
+                        LOG.info(f"[ingest] sr_in={sr_in}, dtype={mono.dtype}, chunk={len(pcmf32)} bytes")
+                        sr_last = sr_in
+                    else:
+                        LOG.info(f"[ingest] tx≈{sent_bytes/1024:.1f} KiB")
+
+        asyncio.create_task(forward_audio_to_whisper())
 
     @pc.on("connectionstatechange")
     async def _on_state():
@@ -344,6 +325,7 @@ INDEX_HTML = """<!doctype html>
 <head>
 <meta charset="utf-8">
 <title>AI Receptionist (WebRTC)</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
  body{font-family:system-ui,Arial,sans-serif;margin:2rem}
  button{padding:.6rem 1rem;font-size:1rem}
@@ -416,9 +398,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
-
-
-
