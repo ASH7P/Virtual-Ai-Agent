@@ -15,6 +15,10 @@ from prompts import SYSTEM_PROMPT as _SYS_PROMPT, TTS_INSTRUCTIONS
 logging.basicConfig(level=logging.INFO)
 LOG = logging.getLogger("ws_gateway")
 
+# Minimum chunk size Whisper should see (200 ms @ 16 kHz float32)
+MIN_SAMPLES = 3200                     # 0.2s * 16000 Hz
+MIN_BYTES   = MIN_SAMPLES * 4          # float32 = 4 bytes/sample
+
 WHISPER_WS_URL = os.getenv("WHISPER_WS_URL", "ws://127.0.0.1:9090")
 
 # Azure TTS (streaming)
@@ -47,10 +51,11 @@ class WhisperBridge:
         self.buffer = []
         self.on_partial = None
         self.on_eos = None
-
         # metering
         self._tx_bytes = 0
         self._t0 = None
+        # chunk accumulator
+        self._accum = bytearray()
 
     async def start(self):
         self.ws = await websockets.connect(self.url, max_size=10*1024*1024)
@@ -67,6 +72,8 @@ class WhisperBridge:
             "enable_translation": False,
         }
         await self.ws.send(json.dumps(opts))
+        # Optional: warm-up silence (200 ms) to avoid "too short" at start
+        await self.send_silence_ms(200)
         asyncio.create_task(self._recv_loop())
 
     async def _recv_loop(self):
@@ -91,15 +98,31 @@ class WhisperBridge:
                     await self.on_eos(text)
                 self.buffer = []
 
-    async def send_pcm_f32_16k(self, chunk: bytes):
-        if not chunk or self.ws is None:
+    async def send_silence_ms(self, ms: int):
+        if self.ws is None or ms <= 0:
             return
-        await self.ws.send(chunk)
-        # meter
+        samples = int(16000 * (ms / 1000.0))
+        await self._send_chunk(bytes(samples * 4))  # float32 zeros
+
+    async def send_pcm_f32_16k(self, chunk: bytes):
+        """Append small browser frames and emit only >=200ms payloads."""
+        if not chunk:
+            return
+        self._accum.extend(chunk)
+        while len(self._accum) >= MIN_BYTES:
+            payload = bytes(self._accum[:MIN_BYTES])
+            del self._accum[:MIN_BYTES]
+            await self._send_chunk(payload)
+
+    async def _send_chunk(self, payload: bytes):
+        if self.ws is None or not payload:
+            return
+        await self.ws.send(payload)
+        # meter once per ~1s
         now = asyncio.get_event_loop().time()
         if self._t0 is None:
             self._t0 = now
-        self._tx_bytes += len(chunk)
+        self._tx_bytes += len(payload)
         if now - self._t0 >= 1.0:
             kbps = (self._tx_bytes * 8) / 1000.0 / (now - self._t0)
             LOG.info(f"[ingest→whisper] {self._tx_bytes/1024:.1f} KiB in {now - self._t0:.1f}s (~{kbps:.1f} kbps)")
@@ -107,6 +130,12 @@ class WhisperBridge:
             self._t0 = now
 
     async def close(self):
+        # Flush/pad any tail to a full 200ms frame
+        if self._accum:
+            if len(self._accum) < MIN_BYTES:
+                self._accum.extend(b"\x00" * (MIN_BYTES - len(self._accum)))
+            await self._send_chunk(bytes(self._accum))
+            self._accum.clear()
         if self.ws:
             try:
                 await self.ws.send(b"END_OF_AUDIO")
@@ -116,6 +145,7 @@ class WhisperBridge:
                 await self.ws.close()
             except:
                 pass
+
 
 class TTSPusher:
     """Streams Azure TTS PCM to a browser over a WebSocket as 24k int16 frames."""
@@ -207,4 +237,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
