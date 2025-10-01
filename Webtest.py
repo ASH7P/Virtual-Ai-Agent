@@ -5,7 +5,7 @@ import asyncio
 import logging
 import numpy as np
 import websockets
-from websockets.server import serve
+from websockets.asyncio.server import serve
 from openai import AsyncAzureOpenAI
 
 # Your existing LLM for text only (unchanged)
@@ -237,5 +237,6 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
 
 
