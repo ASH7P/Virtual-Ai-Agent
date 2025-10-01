@@ -19,7 +19,7 @@ WHISPER_WS_URL = os.getenv("WHISPER_WS_URL", "ws://127.0.0.1:9090")
 
 # Azure TTS (streaming)
 AZURE_OPENAI_ENDPOINT = os.getenv("ENDPOINT_URL", "https://ttsmodel3.openai.azure.com/")
-AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY", "")
+AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY", "2nnLldWRJFxVegf69V94gzqF2QzlkgYaaISUiCl2bLt6YHRDFRqZJQQJ99BIACHYHv6XJ3w3AAABACOG0eBS")
 AZURE_TTS_MODEL = os.getenv("AZURE_TTS_DEPLOYMENT", "gpt-4o-mini-tts")
 AZURE_TTS_VOICE = os.getenv("AZURE_TTS_VOICE", "onyx")
 
@@ -207,3 +207,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
