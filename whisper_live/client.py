@@ -12,6 +12,13 @@ import uuid
 import time
 import av
 import whisper_live.utils as utils
+import asyncio
+from Ai_engine import LLM_Client, AzureTTSTrack
+from prompts import SYSTEM_PROMPT, TTS_INSTRUCTIONS
+
+# Initialize the LLM client with a system prompt
+track = AzureTTSTrack()
+llm_client = LLM_Client(system_prompt=SYSTEM_PROMPT)
 
 
 class Client:
@@ -88,6 +95,7 @@ class Client:
         self.clip_audio = clip_audio
         self.same_output_threshold = same_output_threshold
         self.transcription_callback = transcription_callback
+        self.current_text = "" # New
 
         # Translation-specific attributes
         self.enable_translation = enable_translation
@@ -183,6 +191,7 @@ class Client:
             
             utils.clear_screen()
             utils.print_transcript(original_text)
+            self.current_text = " ".join(original_text) # New
             if self.enable_translation:
                 print(f"\n\nTRANSLATION to {self.target_language}:")
                 utils.print_transcript([seg["text"] for seg in self.translated_transcript[-4:]], translated=True)
@@ -234,6 +243,15 @@ class Client:
         
         if "translated_segments" in message.keys():
             self.process_segments(message["translated_segments"], translated=True)
+        
+        if "message" in message.keys() and message["message"] == "EOS": # New
+            self.recording = False
+            if self.current_text.strip(): # New
+                response = llm_client.generate_reply(self.current_text) # New
+                if response.strip(): # New
+                    asyncio.run(llm_client.stream_tts(response, track, TTS_INSTRUCTIONS)) # New
+            self.current_text = "" # New
+            self.recording = True
 
     def on_error(self, ws, error):
         print(f"[ERROR] WebSocket Error: {error}")

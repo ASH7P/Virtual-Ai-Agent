@@ -331,7 +331,7 @@ class TranscriptionServer:
                 client.set_eos(True)
             return False
 
-        if self.backend.is_tensorrt():
+        if self.backend.is_tensorrt() or self.backend.is_faster_whisper():
             voice_active = self.voice_activity(websocket, frame_np)
             if voice_active:
                 self.no_voice_activity_chunks = 0

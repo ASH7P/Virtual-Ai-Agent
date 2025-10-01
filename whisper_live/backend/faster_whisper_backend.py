@@ -170,6 +170,17 @@ class ServeClientFasterWhisper(ServeClientBase):
             local_files_only=False,
         )
 
+    def set_eos(self, eos): #NEW
+        """
+        Sets the End of Speech (EOS) flag.
+
+        Args:
+            eos (bool): The value to set for the EOS flag.
+        """
+        self.lock.acquire()
+        self.eos = eos
+        self.lock.release()
+
     def set_language(self, info):
         """
         Updates the language attribute based on the detected language information.
@@ -234,3 +245,5 @@ class ServeClientFasterWhisper(ServeClientBase):
 
         if len(segments):
             self.send_transcription_to_client(segments)
+            if self.eos:  #NEW
+                self.send_eos_flag()

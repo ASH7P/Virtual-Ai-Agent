@@ -247,6 +247,23 @@ class ServeClientBase(object):
         except Exception as e:
             logging.error(f"[ERROR]: Sending data to client: {e}")
 
+    def send_eos_flag(self): #NEW
+        """
+        Notify the client of end-of-stream (EOS) and send an EOS message.
+
+        This method sends an EOS message to the client via the WebSocket connection to notify them
+        that the transcription service has reached the end of the audio stream.
+
+        """
+        self.lock.acquire()
+        try:
+            self.websocket.send(json.dumps({
+                "uid": self.client_uid,
+                "message": "EOS"
+            }))
+        except Exception as e:
+            logging.error(f"[ERROR]: Sending EOS to client: {e}")
+
     def disconnect(self):
         """
         Notify the client of disconnection and send a disconnect message.
