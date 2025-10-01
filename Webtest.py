@@ -148,7 +148,6 @@ class WhisperBridge:
 
 
 class TTSPusher:
-    """Streams Azure TTS PCM to a browser over a WebSocket as 24k int16 frames."""
     def __init__(self):
         self.client = AsyncAzureOpenAI(
             api_key=AZURE_OPENAI_API_KEY,
@@ -168,11 +167,20 @@ class TTSPusher:
                 response_format="pcm",   # 24 kHz int16 mono
             ) as resp:
                 async for chunk in resp.iter_bytes():
-                    # Send binary chunks to browser (tag: tts_pcm24)
                     await ws_client.send(chunk)
+        except Exception as e:
+            # NEW: make failures visible client-side
+            try:
+                await ws_client.send(json.dumps({"type":"tts_error","message":str(e)}))
+            except:
+                pass
+            raise
         finally:
-            # Tell browser we finished
-            await ws_client.send(json.dumps({"type": "tts_end"}))
+            # Always send end marker
+            try:
+                await ws_client.send(json.dumps({"type": "tts_end"}))
+            except:
+                pass
 
 async def ws_handler(websocket):
     """
@@ -237,6 +245,5 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
 
 
