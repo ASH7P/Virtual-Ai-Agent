@@ -156,27 +156,43 @@ class TTSPusher:
         )
 
     async def speak_to_ws(self, ws_client, text: str):
-        # Tell browser a new TTS stream is starting
         await ws_client.send(json.dumps({"type": "tts_start"}))
         try:
+            # 24 kHz, 16-bit mono → ~48k bytes/sec
+            TARGET_MS = 60                       # send ~60 ms frames
+            BYTES_PER_MS = 48000 // 1000         # 48 bytes/ms at 24 kHz int16 mono
+            TARGET_BYTES = TARGET_MS * BYTES_PER_MS
+    
+            buf = bytearray()
+    
             async with self.client.audio.speech.with_streaming_response.create(
                 model=AZURE_TTS_MODEL,
                 voice=AZURE_TTS_VOICE,
                 input=text,
                 instructions=TTS_INSTRUCTIONS,
-                response_format="pcm",   # 24 kHz int16 mono
+                response_format="pcm",  # 24k int16 mono
             ) as resp:
                 async for chunk in resp.iter_bytes():
-                    await ws_client.send(chunk)
+                    if not chunk:
+                        continue
+                    buf.extend(chunk)
+                    # While we have enough audio, send a frame
+                    while len(buf) >= TARGET_BYTES:
+                        frame = bytes(buf[:TARGET_BYTES])
+                        del buf[:TARGET_BYTES]
+                        await ws_client.send(frame)
+    
+                # Flush any tail so we don't cut off phonemes
+                if buf:
+                    await ws_client.send(bytes(buf))
+    
         except Exception as e:
-            # NEW: make failures visible client-side
             try:
                 await ws_client.send(json.dumps({"type":"tts_error","message":str(e)}))
             except:
                 pass
             raise
         finally:
-            # Always send end marker
             try:
                 await ws_client.send(json.dumps({"type": "tts_end"}))
             except:
@@ -239,12 +255,13 @@ async def ws_handler(websocket):
         await whisper.close()
 
 async def main():
-    async with serve(ws_handler, host=HOST, port=PORT, max_size=10*1024*1024):
+    async with serve(ws_handler, host=HOST, port=PORT, max_size=10*1024*1024, compression=None):
         LOG.info(f"[ws] listening on ws://{HOST}:{PORT}")
         await asyncio.Future()
 
 if __name__ == "__main__":
     asyncio.run(main())
+
 
 
 
