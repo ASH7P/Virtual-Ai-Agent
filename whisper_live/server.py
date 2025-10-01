@@ -150,6 +150,7 @@ class TranscriptionServer:
         self.no_voice_activity_chunks = 0
         self.use_vad = True
         self.single_model = False
+        self.eos_sent = False
 
     def initialize_client(
         self, websocket, options, faster_whisper_custom_model_path,
@@ -308,7 +309,7 @@ class TranscriptionServer:
                 websocket.close()
                 return False  # Indicates that the connection should not continue
 
-            if self.backend.is_tensorrt():
+            if self.use_vad and (self.backend.is_tensorrt() or self.backend.is_faster_whisper()):
                 self.vad_detector = VoiceActivityDetector(frame_rate=self.RATE)
             self.initialize_client(websocket, options, faster_whisper_custom_model_path,
                                    whisper_tensorrt_path, trt_multilingual, trt_py_session=trt_py_session)
@@ -458,17 +459,32 @@ class TranscriptionServer:
         Returns:
             bool: True if voice activity is detected in the current frame, False otherwise. When returning False
                 after detecting no voice activity for more than three consecutive frames, it also triggers the
-                end-of-speech (EOS) flag for the client.
+                   end-of-speech (EOS) flag for the client.
         """
-        if not self.vad_detector(frame_np):
-            self.no_voice_activity_chunks += 1
-            if self.no_voice_activity_chunks > 3:
-                client = self.client_manager.get_client(websocket)
-                if not client.eos:
-                    client.set_eos(True)
-                time.sleep(0.1)    # Sleep 100m; wait some voice activity.
-            return False
-        return True
+        # returns True if speech present
+        has_voice = self.vad_detector(frame_np)
+        client = self.client_manager.get_client(websocket)
+
+        if has_voice:
+            self.no_voice_activity_chunks = 0
+            # reset “turn” flags as soon as speech returns
+            if self.eos_sent:
+                self.eos_sent = False
+            if getattr(client, "eos", False):
+                client.set_eos(False)
+            setattr(client, "suppress_output", False)
+            return True
+
+        # no voice this chunk
+        self.no_voice_activity_chunks += 1
+        if self.no_voice_activity_chunks > 3 and not self.eos_sent:
+            # declare end of user turn
+            client.set_eos(True)
+            client.send_eos_flag()     # <— THE ONLY PLACE WE SEND "EOS"
+            print("No voice activity detected. Sent EOS to client.")
+            self.eos_sent = True
+            setattr(client, "suppress_output", True)
+        return False
 
     def cleanup(self, websocket):
         """

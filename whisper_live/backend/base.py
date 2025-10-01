@@ -53,6 +53,7 @@ class ServeClientBase(object):
         self.transcript = []
         self.end_time_for_same_output = None
         self.translation_queue = translation_queue
+        self.suppress_output = False
 
         # threading
         self.lock = threading.Lock()
@@ -237,6 +238,10 @@ class ServeClientBase(object):
         Returns:
             segments (list): A list of transcription segments to be sent to the client.
         """
+
+        if getattr(self, "suppress_output", False):
+            return
+    
         try:
             self.websocket.send(
                 json.dumps({
@@ -255,7 +260,6 @@ class ServeClientBase(object):
         that the transcription service has reached the end of the audio stream.
 
         """
-        self.lock.acquire()
         try:
             self.websocket.send(json.dumps({
                 "uid": self.client_uid,

@@ -6,10 +6,11 @@ import numpy as np
 from openai import AzureOpenAI, AsyncAzureOpenAI
 from aiortc import MediaStreamTrack
 from av.audio.frame import AudioFrame
+import sounddevice as sd  # NEW: play PCM to local speakers
 
 
 # ---------------------------
-# WebRTC track for audio
+# WebRTC track placeholder (unchanged, but unused for speaker demo)
 # ---------------------------
 class AzureTTSTrack(MediaStreamTrack):
     kind = "audio"
@@ -27,6 +28,9 @@ class AzureTTSTrack(MediaStreamTrack):
         frame.planes[0].update(samples.tobytes())
         return frame
 
+endpoint = os.getenv("ENDPOINT_URL", "https://ttsmodel3.openai.azure.com/")
+# deployment = os.getenv("DEPLOYMENT_NAME", "gpt-5-nano")
+subscription_key = os.getenv("AZURE_OPENAI_API_KEY", "2nnLldWRJFxVegf69V94gzqF2QzlkgYaaISUiCl2bLt6YHRDFRqZJQQJ99BIACHYHv6XJ3w3AAABACOG0eBS")
 
 # ---------------------------
 # Chat + TTS client
@@ -34,14 +38,14 @@ class AzureTTSTrack(MediaStreamTrack):
 class LLM_Client:
     def __init__(self, system_prompt: str):
         self.chat_client = AzureOpenAI(
-            api_key=os.getenv("AZURE_API_KEY"),
-            azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
+            api_key=subscription_key,
+            azure_endpoint=endpoint,
             api_version="2025-01-01-preview",
         )
         self.tts_client = AsyncAzureOpenAI(
-            api_key=os.getenv("AZURE_API_KEY"),
-            azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
-            api_version=os.getenv("AZURE_API_VERSION"),
+            api_key=subscription_key,
+            azure_endpoint=endpoint,
+            api_version="2025-03-01-preview",
         )
 
         self.chat_deployment = os.getenv("AZURE_CHAT_DEPLOYMENT", "gpt-4.1-nano")
@@ -51,7 +55,6 @@ class LLM_Client:
         self.history = [{"role": "system", "content": system_prompt}]
 
     def generate_reply(self, user_input: str) -> str:
-        # 3. Generate completion (YOUR original logic preserved)
         self.history.append({"role": "user", "content": user_input})
 
         completion = self.chat_client.chat.completions.create(
@@ -62,9 +65,8 @@ class LLM_Client:
             stream=False,
         )
 
-        # Your JSON parsing logic intact
         try:
-            message = json.loads(completion.choices[0].message.content)["message"]
+            message = json.loads(completion.choices[0].message.content.strip())["message"]
         except Exception:
             message = completion.choices[0].message.content
 
@@ -72,14 +74,33 @@ class LLM_Client:
         return message
 
     async def stream_tts(self, text: str, track: AzureTTSTrack, instructions: str):
-        # 5. Async function for TTS (switched from .stream_to_file → queue for WebRTC)
-        async with self.tts_client.audio.speech.with_streaming_response.create(
-            model=self.tts_deployment,
-            voice="onyx",
-            input=text,
-            instructions=instructions,
-            response_format="pcm",   # PCM is best for RTP/WebRTC
-            sample_rate=16000,
-        ) as response:
-            async for chunk in response.aiter_bytes():
-                await track.queue.put(chunk)
+        """
+        Stream Azure TTS as PCM directly to local speakers.
+        Signature unchanged so server.py doesn't need edits.
+        The 'track' argument is intentionally ignored for this local demo.
+        """
+        _ = track  # keep signature; not used for local speaker playback
+
+        # Azure's TTS PCM default samplerate is typically 24000 Hz for gpt-4o-mini-tts
+        playback_rate = 24000
+        stream = sd.OutputStream(
+            samplerate=playback_rate,
+            channels=1,
+            dtype="int16",
+            blocksize=0,
+        )
+        stream.start()
+        try:
+            async with self.tts_client.audio.speech.with_streaming_response.create(
+                model=self.tts_deployment,
+                voice="onyx",
+                input=text,
+                instructions=instructions,
+                response_format="pcm",   # 16-bit PCM; no sample_rate arg here
+            ) as response:
+                async for chunk in response.iter_bytes():
+                    samples = np.frombuffer(chunk, dtype=np.int16).reshape(-1, 1)
+                    stream.write(samples)
+        finally:
+            stream.stop()
+            stream.close()

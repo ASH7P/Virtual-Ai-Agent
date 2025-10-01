@@ -96,6 +96,7 @@ class Client:
         self.same_output_threshold = same_output_threshold
         self.transcription_callback = transcription_callback
         self.current_text = "" # New
+        self.paused = False # New
 
         # Translation-specific attributes
         self.enable_translation = enable_translation
@@ -245,13 +246,16 @@ class Client:
             self.process_segments(message["translated_segments"], translated=True)
         
         if "message" in message.keys() and message["message"] == "EOS": # New
-            self.recording = False
+            self.paused = True
             if self.current_text.strip(): # New
                 response = llm_client.generate_reply(self.current_text) # New
+                print(f"\n\n[AI]: {response}\n\n") # New
                 if response.strip(): # New
+                    print("[AI]: Generating speech...") # New
                     asyncio.run(llm_client.stream_tts(response, track, TTS_INSTRUCTIONS)) # New
+
             self.current_text = "" # New
-            self.recording = True
+            self.paused = False # New
 
     def on_error(self, ws, error):
         print(f"[ERROR] WebSocket Error: {error}")
@@ -450,7 +454,7 @@ class TranscriptionTeeClient:
             unconditional (bool, optional): If true, send regardless of whether clients are recording.  Default is False.
         """
         for client in self.clients:
-            if (unconditional or client.recording):
+            if unconditional or (client.recording and not getattr(client, "paused", False)):
                 client.send_packet_to_server(packet)
 
     def play_file(self, filename):
@@ -651,8 +655,13 @@ class TranscriptionTeeClient:
             os.makedirs("chunks")
         try:
             for _ in range(0, int(self.rate / self.chunk * self.record_seconds)):
-                if not any(client.recording for client in self.clients):
+                # Stop only if all clients truly stopped (not just paused)
+                if not any(c.recording for c in self.clients):
                     break
+                # While paused (EOS → LLM/TTS), don’t read/forward mic
+                if any(getattr(c, "paused", False) for c in self.clients):
+                    time.sleep(self.chunk / float(self.rate))
+                    continue
                 data = self.stream.read(self.chunk, exception_on_overflow=False)
                 self.frames += data
 

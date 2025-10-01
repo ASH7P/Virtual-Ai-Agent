@@ -109,6 +109,7 @@ class ServeClientFasterWhisper(ServeClientBase):
             return
 
         self.use_vad = use_vad
+        self.eos = False  #NEW
 
         # threading
         self.trans_thread = threading.Thread(target=self.speech_to_text)
@@ -245,5 +246,3 @@ class ServeClientFasterWhisper(ServeClientBase):
 
         if len(segments):
             self.send_transcription_to_client(segments)
-            if self.eos:  #NEW
-                self.send_eos_flag()
