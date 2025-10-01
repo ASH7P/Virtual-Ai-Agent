@@ -6,128 +6,118 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <style>
     body { font-family: system-ui, Arial, sans-serif; margin: 2rem; }
-    button { padding: .6rem 1rem; font-size: 1rem; }
+    button { padding: .6rem 1rem; font-size: 1rem; margin-right: .5rem; }
     #log { white-space: pre-line; margin-top: 1rem; }
+    .row { margin:.4rem 0; }
+    .you { color:#444; }
+    .bot { color:#0a5; }
+    .status { margin-left:.5rem; font-size:.9rem; color:#666; }
+    #live { color:#999; font-style:italic; }
   </style>
 </head>
 <body>
   <h1>AI Receptionist (WebSocket Demo)</h1>
-  <p>Click Start, allow mic. Speak → Whisper → EOS → LLM → Azure TTS streamed back.</p>
+  <p>
+    Click Start, allow mic. Speak → Whisper → EOS → LLM → Azure TTS streamed back.<br/>
+    <span class="status" id="status">Idle</span>
+  </p>
   <button id="start">Start</button>
   <button id="stop" disabled>Stop</button>
+
+  <div id="history"></div>
+  <div id="live" class="row"></div>
   <div id="log"></div>
 
 <script>
 const log = (s)=>{ document.getElementById('log').textContent += s + "\n"; };
+const setStatus = (s)=>{ document.getElementById('status').textContent = s; };
+const historyEl = document.getElementById('history');
+const liveEl = document.getElementById('live');
 
-let ws, audioCtx, workletNode, ttsPlayer;
+let ws, audioCtx, micNode;
 let running = false;
 
-// --- TTS player using AudioWorklet (consumes 24k int16 PCM) ---
+// simple state machine
+const State = Object.freeze({ IDLE:0, LISTENING:1, THINKING:2, SPEAKING:3 });
+let state = State.IDLE;
+let listening = false;         // gates whether we send mic frames to WS
+let liveText = "";             // current partial buffer
+
+// --- TTS player using AudioWorklet (24k int16 -> upsample to output rate) ---
 class PCM24Player {
-  constructor(ctx){
-    this.ctx = ctx;
-    this.port = null;
-    this.started = false;
-  }
+  constructor(ctx){ this.ctx = ctx; this.node = null; this.started = false; }
   async init(){
-    if (!this.started){
-      await this.ctx.audioWorklet.addModule(URL.createObjectURL(new Blob([`
-        class PCM24Sink extends AudioWorkletProcessor {
-          constructor(){ super(); this.buf=[]; this.r=24000; }
-          process(inputs, outputs, params) {
-            const out = outputs[0][0];
-            // If no queued data, output silence
-            if (this.buf.length === 0) { out.fill(0); return true; }
-            // Fill output (128 frames @ ctx.sampleRate; browser is typically 48k)
-            // Simple resample 24k -> render rate by duplication
-            const need = out.length;
-            let tmp = new Float32Array(need);
-            let filled = 0;
-            while (filled < need){
-              if (this.buf.length === 0) break;
-              const chunk = this.buf.shift(); // Float32 @ 24k
-              const ratio = sampleRate / this.r;
-              // naive upsample: nearest-neighbor (good enough for TTS)
-              const up = new Float32Array(Math.round(chunk.length * ratio));
-              for (let i=0;i<up.length;i++){
-                const idx = Math.min(chunk.length-1, Math.floor(i/ratio));
-                up[i] = chunk[idx];
-              }
-              const toCopy = Math.min(up.length, need - filled);
-              tmp.set(up.subarray(0,toCopy), filled);
-              filled += toCopy;
-              if (toCopy < up.length){
-                // push remainder back
-                this.buf.unshift(up.subarray(toCopy));
-              }
+    if (this.started) return;
+    await this.ctx.audioWorklet.addModule(URL.createObjectURL(new Blob([`
+      class PCM24Sink extends AudioWorkletProcessor {
+        constructor(){ super(); this.buf=[]; this.r=24000; this.port.onmessage = (e)=> {
+          if (e.data && e.data.cmd === 'push') this.buf.push(e.data.f32);
+        }; }
+        process(inputs, outputs) {
+          const out = outputs[0][0];
+          out.fill(0);
+          let filled = 0;
+          while (filled < out.length && this.buf.length) {
+            const chunk = this.buf.shift();             // Float32 @ 24k
+            const ratio = sampleRate / this.r;          // upsample to render rate
+            const upLen = Math.max(1, Math.round(chunk.length * ratio));
+            const up = new Float32Array(upLen);
+            for (let i=0;i<upLen;i++) {
+              const idx = Math.min(chunk.length-1, Math.floor(i/ratio));
+              up[i] = chunk[idx];
             }
-            out.set(tmp);
-            return true;
+            const toCopy = Math.min(up.length, out.length - filled);
+            out.set(up.subarray(0, toCopy), filled);
+            filled += toCopy;
+            if (toCopy < up.length) {
+              // put remainder back at front
+              this.buf.unshift(up.subarray(toCopy));
+            }
           }
+          return true;
         }
-        registerProcessor('pcm24-sink', PCM24Sink);
-      `], {type:'application/javascript'})));
-      this.node = new AudioWorkletNode(this.ctx, 'pcm24-sink');
-      this.node.connect(this.ctx.destination);
-      this.port = this.node.port;
-      this.started = true;
-    }
+      }
+      registerProcessor('pcm24-sink', PCM24Sink);
+    `], {type:'application/javascript'})));
+    this.node = new AudioWorkletNode(this.ctx, 'pcm24-sink');
+    this.node.connect(this.ctx.destination);
+    this.started = true;
   }
-  async enqueueInt16Mono24k(bytes){
+  async pushInt16Mono24k(bytes){
     await this.init();
-    // Convert int16 -> float32 [-1,1] @ 24k
+    // int16 -> float32 [-1,1]
     const s16 = new Int16Array(bytes.buffer, bytes.byteOffset, Math.floor(bytes.byteLength/2));
     const f32 = new Float32Array(s16.length);
-    for (let i=0;i<s16.length;i++){ f32[i] = Math.max(-1, Math.min(1, s16[i]/32768)); }
-    // Send to worklet via shared buffer (queue inside processor)
-    // Here we push via ring: hack by posting as transferable? Simpler: store on node (not ideal).
-    // Instead, we’ll emulate a queue using a tiny ScriptProcessor on main:
-    // For brevity, we’ll push via a custom method:
-    this.node.port.postMessage({pcm:f32});
+    for (let i=0;i<s16.length;i++) f32[i] = Math.max(-1, Math.min(1, s16[i]/32768));
+    this.node.port.postMessage({cmd:'push', f32}, [f32.buffer]);
   }
 }
+let ttsPlayer;
 
-async function start(){
-  if (running) return;
-  running = true;
-  document.getElementById('start').disabled = true;
-  document.getElementById('stop').disabled = false;
-
+// --- mic worklet (downsample to ~16k, emit 20ms frames); gated by `listening` ---
+async function setupMic(){
   audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-  ttsPlayer = new PCM24Player(audioCtx);
-  await ttsPlayer.init();
-
-  // Capture mic and resample to 16k float32 in an AudioWorklet
   await audioCtx.audioWorklet.addModule(URL.createObjectURL(new Blob([`
     class MicProcessor extends AudioWorkletProcessor {
       constructor(){
         super();
-        this.buffer = [];
-        this.decim = Math.round(sampleRate / 16000); // assume 48k -> 16k
-        if (this.decim < 1) this.decim = 1;
-        this.port.onmessage = (e)=>{};
+        this.decim = Math.max(1, Math.round(sampleRate / 16000)); // e.g. 48000->3
       }
-      process(inputs, outputs){
+      process(inputs){
         const input = inputs[0];
         if (!input || input.length === 0) return true;
-        const ch0 = input[0]; // Float32Array @ device rate
+        const ch0 = input[0];
         if (!ch0) return true;
-
-        // Downsample to ~16k by decimation (simple + good enough for STT)
+        // downsample by decimation (good enough for STT)
         const step = this.decim;
         const outLen = Math.floor(ch0.length / step);
         const f32_16k = new Float32Array(outLen);
-        for (let i=0, j=0; j<outLen; i+=step, j++){ f32_16k[j] = ch0[i]; }
-
-        // Send to main thread in ~20ms frames (320 samples @16k)
+        for (let i=0,j=0; j<outLen; i+=step, j++) f32_16k[j] = ch0[i];
+        // slice into 20ms frames (320 samples @16k)
         const FRAME = 320;
-        let idx = 0;
-        while (idx < f32_16k.length){
-          const end = Math.min(f32_16k.length, idx + FRAME);
-          const slice = f32_16k.subarray(idx, end);
-          this.port.postMessage({pcm:slice}, [slice.buffer]);
-          idx = end;
+        for (let idx = 0; idx < f32_16k.length; idx += FRAME) {
+          const slice = f32_16k.subarray(idx, Math.min(f32_16k.length, idx + FRAME));
+          this.port.postMessage(slice, [slice.buffer]);
         }
         return true;
       }
@@ -137,17 +127,72 @@ async function start(){
 
   const stream = await navigator.mediaDevices.getUserMedia({audio:true, video:false});
   const src = audioCtx.createMediaStreamSource(stream);
-  const micNode = new AudioWorkletNode(audioCtx, 'mic-proc');
-  micNode.port.onmessage = (e)=>{
-    const {pcm} = e.data;
-    if (ws && ws.readyState === WebSocket.OPEN){
-      // Send as binary float32
-      ws.send(pcm.buffer);
-    }
-  };
-  src.connect(micNode).connect(audioCtx.destination); // destination just keeps graph alive; muted by default
+  micNode = new AudioWorkletNode(audioCtx, 'mic-proc');
 
-  // Connect WS to gateway
+  micNode.port.onmessage = (e)=>{
+    if (!listening || !ws || ws.readyState !== WebSocket.OPEN) return;
+    const f32 = e.data;                 // Float32Array (16k mono)
+    ws.send(f32.buffer);                // send binary
+  };
+
+  // we don't output mic to speakers; keeping the node connected keeps the graph alive
+  src.connect(micNode);
+}
+
+function appendUserLine(text) {
+  const row = document.createElement('div');
+  row.className = 'row you';
+  row.textContent = `You: ${text}`;
+  historyEl.appendChild(row);
+  historyEl.scrollTop = historyEl.scrollHeight;
+}
+
+function appendBotLine(text) {
+  const row = document.createElement('div');
+  row.className = 'row bot';
+  row.textContent = `Assistant: ${text}`;
+  historyEl.appendChild(row);
+  historyEl.scrollTop = historyEl.scrollHeight;
+}
+
+function beginListening() {
+  state = State.LISTENING;
+  listening = true;
+  liveText = "";
+  liveEl.textContent = "";
+  setStatus("Listening… (speak)");
+}
+
+function beginThinking() {
+  state = State.THINKING;
+  listening = false;         // gate mic OFF
+  setStatus("Thinking…");
+}
+
+function beginSpeaking() {
+  state = State.SPEAKING;
+  listening = false;         // keep mic OFF during TTS
+  setStatus("Speaking…");
+}
+
+function endSpeakingThenListen() {
+  // small guard to avoid immediate re-trigger; resume mic
+  beginListening();
+}
+
+// === Start/Stop ===
+document.getElementById('start').onclick = async () => {
+  if (running) return;
+  running = true;
+  document.getElementById('start').disabled = true;
+  document.getElementById('stop').disabled = false;
+
+  // init audio + tts player
+  ttsPlayer = new PCM24Player(audioCtx || new (window.AudioContext || window.webkitAudioContext)());
+  await setupMic();
+  await ttsPlayer.init();
+
+  // connect WS to gateway (same host via tunnel or HTTPS proxy)
   const url = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.hostname + ':8765';
   ws = new WebSocket(url);
   ws.binaryType = 'arraybuffer';
@@ -155,39 +200,70 @@ async function start(){
   ws.onopen = () => {
     log('[ws] connected');
     ws.send(JSON.stringify({type:'hello'}));
+    beginListening();
   };
+
   ws.onmessage = async (ev) => {
     if (typeof ev.data === 'string'){
       const msg = JSON.parse(ev.data);
-      if (msg.type === 'ack') log('[ws] ack');
-      if (msg.type === 'partial') log('[partial] ' + msg.text);
-      if (msg.type === 'assistant_text') log('[assistant] ' + msg.text);
-      if (msg.type === 'tts_start') log('[tts] start');
-      if (msg.type === 'tts_end') log('[tts] end');
+      switch (msg.type) {
+        case 'ack':
+          log('[ws] ack');
+          break;
+        case 'partial':
+          if (state === State.LISTENING) {
+            liveText = msg.text || '';
+            liveEl.textContent = liveText ? `… ${liveText}` : '';
+          }
+          break;
+        case 'assistant_text':
+          // Treat this as EOS boundary: commit your last user text, pause mic
+          if (liveText) {
+            appendUserLine(liveText);
+            liveText = "";
+            liveEl.textContent = "";
+          }
+          beginThinking();
+          appendBotLine(msg.text || '');
+          break;
+        case 'tts_start':
+          beginSpeaking();
+          break;
+        case 'tts_end':
+          endSpeakingThenListen();
+          break;
+        default:
+          // ignore
+          break;
+      }
     } else {
-      // Binary = 24k int16 PCM from Azure TTS
+      // Binary = Azure TTS PCM 24k int16
+      if (state !== State.SPEAKING) beginSpeaking();
       const buf = new Uint8Array(ev.data);
-      // Push to player
-      // NOTE: our simple worklet reads via .port messages; we’ll pass bytes as is:
-      await ttsPlayer.enqueueInt16Mono24k(buf);
+      await ttsPlayer.pushInt16Mono24k(buf);
     }
   };
-  ws.onclose = ()=> log('[ws] closed');
-}
 
-async function stop(){
+  ws.onclose = ()=> {
+    log('[ws] closed');
+    state = State.IDLE;
+    listening = false;
+    setStatus('Idle');
+  };
+};
+
+document.getElementById('stop').onclick = async () => {
   running = false;
+  listening = false;
   if (ws && ws.readyState === WebSocket.OPEN){
-    ws.send(JSON.stringify({type:'eos'})); // optional: force EOS
+    ws.send(JSON.stringify({type:'eos'})); // optional
     ws.close();
   }
-  if (audioCtx){ await audioCtx.close(); }
+  try { if (audioCtx) await audioCtx.close(); } catch {}
   document.getElementById('start').disabled = false;
   document.getElementById('stop').disabled = true;
-}
-
-document.getElementById('start').onclick = start;
-document.getElementById('stop').onclick = stop;
+  setStatus('Idle');
+};
 </script>
 </body>
 </html>
