@@ -18,19 +18,15 @@
 <body>
   <h1>AI Receptionist (WebSocket Demo)</h1>
   <p>
-    Click Start, allow mic. Speak → Whisper → EOS → LLM → Azure TTS streamed back.
+    Click Start, allow mic. Speak → Whisper → EOS → LLM → Azure TTS streamed back.<br/>
     <span class="status" id="status">Idle</span>
   </p>
   <button id="start">Start</button>
   <button id="stop" disabled>Stop</button>
-  <button id="beep" disabled>Test Beep</button>
-  <label style="margin-left:.5rem">Gain
-    <input id="gain" type="range" min="0" max="2" value="1" step="0.05">
-  </label>
 
-  <div id="history" style="margin-top:1rem"></div>
-  <div id="live" class="row" style="color:#888;font-style:italic"></div>
-  <div id="log" style="white-space:pre-line;margin-top:1rem;color:#555"></div>
+  <div id="history"></div>
+  <div id="live" class="row"></div>
+  <div id="log"></div>
 
 <script>
 const log = (s)=>{ document.getElementById('log').textContent += s + "\n"; };
@@ -38,108 +34,81 @@ const setStatus = (s)=>{ document.getElementById('status').textContent = s; };
 const historyEl = document.getElementById('history');
 const liveEl = document.getElementById('live');
 
-let ws, audioCtx, micNode, ttsNode, gainNode;
+let ws, audioCtx, micNode;
 let running = false;
 
+// simple state machine
 const State = Object.freeze({ IDLE:0, LISTENING:1, THINKING:2, SPEAKING:3 });
 let state = State.IDLE;
-let listening = false;
-let liveText = "";
+let listening = false;         // gates whether we send mic frames to WS
+let liveText = "";             // current partial buffer
 
-function appendUserLine(text) {
-  const row = document.createElement('div');
-  row.className = 'row';
-  row.textContent = `You: ${text}`;
-  historyEl.appendChild(row);
-}
-function appendBotLine(text) {
-  const row = document.createElement('div');
-  row.className = 'row';
-  row.style.color = '#0a5';
-  row.textContent = `Assistant: ${text}`;
-  historyEl.appendChild(row);
-}
-
-function beginListening(){ state=State.LISTENING; listening=true; liveText=""; liveEl.textContent=""; setStatus("Listening…"); }
-function beginThinking(){ state=State.THINKING; listening=false; setStatus("Thinking…"); }
-function beginSpeaking(){ state=State.SPEAKING; listening=false; setStatus("Speaking…"); }
-function endSpeakingThenListen(){ beginListening(); }
-
-async function ensureCtx() {
-  if (!audioCtx) {
-    audioCtx = new (window.AudioContext || window.webkitAudioContext)({latencyHint:'interactive'});
-  }
-  if (audioCtx.state !== 'running') { try { await audioCtx.resume(); } catch {} }
-}
-
+// --- Simple 24k PCM player using AudioBufferSourceNode queue (no Worklet) ---
 class PCM24Player {
   constructor(ctx){
     this.ctx = ctx;
-    this.workletNode = null;
+    this.started = false;
+    this.playHead = 0;              // scheduled time in AudioContext seconds
+    this.sampleRateIn = 24000;
+    this.gain = this.ctx.createGain();
+    this.gain.gain.value = 1.0;
+    this.gain.connect(this.ctx.destination);
   }
   async init(){
-    if (this.workletNode) return;
-    await this.ctx.audioWorklet.addModule(URL.createObjectURL(new Blob([`
-      class PCM24Sink extends AudioWorkletProcessor {
-        constructor(){
-          super();
-          this.buf = [];
-          this.r = 24000;
-          this.gain = 1.0;
-          this.port.onmessage = (e)=>{
-            const d = e.data||{};
-            if (d.cmd === 'push' && d.f32) this.buf.push(d.f32);
-            if (d.cmd === 'gain' && typeof d.value === 'number') this.gain = d.value;
-          };
-        }
-        process(inputs, outputs){
-          const out = outputs[0];
-          if (!out || out.length === 0) return true;
-          const ch = out[0];  // mono
-          ch.fill(0);
-          let filled = 0;
-          while (filled < ch.length && this.buf.length){
-            const chunk = this.buf.shift(); // Float32 @ 24k
-            const ratio = sampleRate / this.r;
-            const upLen = Math.max(1, Math.round(chunk.length * ratio));
-            for (let i=0;i<upLen && filled<ch.length;i++){
-              const idx = Math.min(chunk.length-1, Math.floor(i/ratio));
-              ch[filled++] = chunk[idx] * this.gain;
-            }
-          }
-          return true;
-        }
-      }
-      registerProcessor('pcm24-sink', PCM24Sink);
-    `], {type:'application/javascript'})));
-    this.workletNode = new AudioWorkletNode(this.ctx, 'pcm24-sink', { numberOfOutputs: 1, outputChannelCount: [1] });
-    // Hook up to a gainNode (master gain)
-    if (!gainNode) {
-      gainNode = this.ctx.createGain();
-      gainNode.gain.value = parseFloat(document.getElementById('gain').value);
-      document.getElementById('gain').oninput = (e)=>{
-        const v = parseFloat(e.target.value);
-        gainNode.gain.value = v;
-        if (this.workletNode) this.workletNode.port.postMessage({cmd:'gain', value:v});
-      };
-    }
-    this.workletNode.connect(gainNode).connect(this.ctx.destination);
-    // Initialize gain in processor too
-    this.workletNode.port.postMessage({cmd:'gain', value: gainNode.gain.value});
+    if (this.started) return;
+    this.started = true;
+    this.playHead = this.ctx.currentTime;
   }
   async pushInt16Mono24k(bytes){
-    await ensureCtx();
     await this.init();
-    const s16 = new Int16Array(bytes.buffer, bytes.byteOffset, Math.floor(bytes.byteLength/2));
-    const f32 = new Float32Array(s16.length);
-    for (let i=0;i<s16.length;i++) f32[i] = Math.max(-1, Math.min(1, s16[i]/32768));
-    this.workletNode.port.postMessage({cmd:'push', f32}, [f32.buffer]);
+
+    // Detect and strip minimal WAV header if present (RIFF/WAVE)
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    let off = 0;
+    if (bytes.byteLength >= 44 &&
+        view.getUint32(0, false) === 0x52494646 &&   // 'RIFF'
+        view.getUint32(8, false) === 0x57415645) {   // 'WAVE'
+      let p = 12;
+      while (p + 8 <= bytes.byteLength) {
+        const id = view.getUint32(p, false);
+        const sz = view.getUint32(p+4, true);
+        if (id === 0x64617461) { // 'data'
+          off = p + 8;
+          break;
+        }
+        p += 8 + sz;
+      }
+    }
+    const byteLen = bytes.byteLength - off;
+    if (byteLen <= 0) return;
+
+    // int16 -> float32 [-1,1]
+    const s16 = new Int16Array(bytes.buffer, bytes.byteOffset + off, Math.floor(byteLen/2));
+    const len = s16.length;
+    const f32 = new Float32Array(len);
+    for (let i=0;i<len;i++) f32[i] = Math.max(-1, Math.min(1, s16[i] / 32768));
+
+    // Queue buffer at 24k; browser resamples to device rate automatically
+    const buf = this.ctx.createBuffer(1, len, this.sampleRateIn);
+    buf.copyToChannel(f32, 0, 0);
+
+    const src = this.ctx.createBufferSource();
+    src.buffer = buf;
+    src.connect(this.gain);
+
+    const now = this.ctx.currentTime;
+    const startAt = Math.max(now, this.playHead);
+    try { src.start(startAt); } catch(e){ console.error('src.start failed', e); }
+    this.playHead = startAt + buf.duration;
+
+    src.onended = () => { try { src.disconnect(); } catch{} };
   }
 }
+let ttsPlayer;
 
-let ttsPlayer = null;
-
+// --- mic worklet (downsample to ~16k, emit 20ms frames); gated by `listening` ---
 async function setupMic(ctx){
+  // Worklet on the SAME context
   await ctx.audioWorklet.addModule(URL.createObjectURL(new Blob([`
     class MicProcessor extends AudioWorkletProcessor {
       constructor(){ super(); this.decim = Math.max(1, Math.round(sampleRate / 16000)); }
@@ -161,107 +130,176 @@ async function setupMic(ctx){
     registerProcessor('mic-proc', MicProcessor);
   `], {type:'application/javascript'})));
 
-  let stream;
-  try {
-    stream = await navigator.mediaDevices.getUserMedia({audio:true, video:false});
-  } catch (e) {
-    log('[mic] error: ' + (e?.message || e)); 
-    log('Tip: open over HTTPS or use an SSH tunnel and visit http://localhost.');
-    throw e;
-  }
+  const stream = await navigator.mediaDevices.getUserMedia({audio:true, video:false});
   const src = ctx.createMediaStreamSource(stream);
   micNode = new AudioWorkletNode(ctx, 'mic-proc');
   micNode.port.onmessage = (e)=>{
     if (!listening || !ws || ws.readyState !== WebSocket.OPEN) return;
-    const f32 = e.data; // Float32Array (16k mono)
-    ws.send(f32.buffer);
+    const f32 = e.data;                 // Float32Array (16k mono)
+    ws.send(f32.buffer);                // binary to gateway
   };
+
+  // Keep graph alive (not routing mic to speakers)
   src.connect(micNode);
 }
 
+// --- tiny beep to verify output path works
+function testBeep(ctx) {
+  try {
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    gain.gain.value = 0.12;
+    osc.type = 'sine';
+    osc.frequency.value = 880;
+    osc.connect(gain).connect(ctx.destination);
+    const t0 = ctx.currentTime + 0.05;
+    osc.start(t0);
+    osc.stop(t0 + 0.15);
+  } catch (e) { console.error('beep error', e); }
+}
+
+function appendUserLine(text) {
+  const row = document.createElement('div');
+  row.className = 'row you';
+  row.textContent = `You: ${text}`;
+  historyEl.appendChild(row);
+  historyEl.scrollTop = historyEl.scrollHeight;
+}
+
+function appendBotLine(text) {
+  const row = document.createElement('div');
+  row.className = 'row bot';
+  row.textContent = `Assistant: ${text}`;
+  historyEl.appendChild(row);
+  historyEl.scrollTop = historyEl.scrollHeight;
+}
+
+function beginListening() {
+  state = State.LISTENING;
+  listening = true;
+  liveText = "";
+  liveEl.textContent = "";
+  setStatus("Listening… (speak)");
+}
+
+function beginThinking() {
+  state = State.THINKING;
+  listening = false;         // gate mic OFF
+  setStatus("Thinking…");
+}
+
+function beginSpeaking() {
+  state = State.SPEAKING;
+  listening = false;         // keep mic OFF during TTS
+  setStatus("Speaking…");
+}
+
+function endSpeakingThenListen() {
+  beginListening();
+}
+
+// === Start/Stop ===
 document.getElementById('start').onclick = async () => {
   if (running) return;
   running = true;
   document.getElementById('start').disabled = true;
   document.getElementById('stop').disabled = false;
-  document.getElementById('beep').disabled = false;
 
-  await ensureCtx();
+  // 1) Create ONE AudioContext and make sure it is resumed by the click
+  audioCtx = new (window.AudioContext || window.webkitAudioContext)({ latencyHint: 'interactive' });
+  try { await audioCtx.resume(); } catch {}
+  testBeep(audioCtx); // quick audible confirmation
+
+  // 2) Init TTS player on the SAME context (no Worklet needed)
   ttsPlayer = new PCM24Player(audioCtx);
   await ttsPlayer.init();
+
+  // 3) Setup mic on the SAME context
   await setupMic(audioCtx);
 
+  // 4) Connect WS
   const url = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.hostname + ':8765';
   ws = new WebSocket(url);
   ws.binaryType = 'arraybuffer';
 
-  ws.onopen = async () => {
+  ws.onopen = () => {
     log('[ws] connected');
-    await ensureCtx();  // user gesture already happened
     ws.send(JSON.stringify({type:'hello'}));
     beginListening();
+  };
+
+  ws.onerror = (e)=> {
+    log('[ws] error ' + (e?.message || ''));
+  };
+
+  ws.onclose = (ev)=> {
+    log(`[ws] closed code=${ev.code} reason=${ev.reason||''}`);
+    state = State.IDLE;
+    listening = false;
+    setStatus('Idle');
   };
 
   ws.onmessage = async (ev) => {
     if (typeof ev.data === 'string'){
       const msg = JSON.parse(ev.data);
-      if (msg.type === 'ack') log('[ws] ack');
-      if (msg.type === 'partial' && state === State.LISTENING'){
-        liveText = msg.text || '';
-        liveEl.textContent = liveText ? `… ${liveText}` : '';
-      }
-      if (msg.type === 'assistant_text'){
-        if (liveText) { appendUserLine(liveText); liveText = ""; liveEl.textContent = ""; }
-        beginThinking();
-        appendBotLine(msg.text || '');
-      }
-      if (msg.type === 'tts_start'){
-        log('[tts] start');
-        await ensureCtx();
-        beginSpeaking();
-      }
-      if (msg.type === 'tts_end'){
-        log('[tts] end');
-        endSpeakingThenListen();
-      }
-      if (msg.type === 'tts_error'){
-        log('[tts_error] ' + (msg.message || 'unknown'));
-        // bounce back to listening even on error
-        endSpeakingThenListen();
+      switch (msg.type) {
+        case 'ack': log('[ws] ack'); break;
+        case 'partial':
+          if (state === State.LISTENING) {
+            liveText = msg.text || '';
+            liveEl.textContent = liveText ? `… ${liveText}` : '';
+          }
+          break;
+        case 'assistant_text':
+          if (liveText) { appendUserLine(liveText); liveText = ""; liveEl.textContent = ""; }
+          beginThinking();
+          appendBotLine(msg.text || '');
+          break;
+        case 'tts_start':
+          try { await audioCtx.resume(); } catch {}
+          beginSpeaking();
+          break;
+        case 'tts_end':
+          endSpeakingThenListen();
+          break;
       }
     } else {
-      // Binary = 24k int16 PCM
-      if (state !== State.SPEAKING) beginSpeaking();
-      await ensureCtx();
-      const buf = new Uint8Array(ev.data);
-      await ttsPlayer.pushInt16Mono24k(buf);
+      // Binary = TTS audio (raw PCM16 mono @24k or WAV with header)
+      const u8 = new Uint8Array(ev.data);
+      log(`[ws] bin ${u8.byteLength} bytes`);
+
+      if (u8.byteLength > 0) {
+        // quick RMS check: if ~0, the data is silent/zeros
+        let sum = 0;
+        for (let i=0; i<u8.byteLength; i+=2) {
+          const s = (u8[i] | (u8[i+1]<<8));
+          const v = (s > 32767 ? s - 65536 : s) / 32768.0;
+          sum += v*v;
+        }
+        const rms = Math.sqrt(sum / Math.max(1, u8.byteLength/2));
+        log(`[audio] rms=${rms.toFixed(4)}`);
+
+        try { await audioCtx.resume(); } catch {}
+        if (state !== State.SPEAKING) beginSpeaking();
+        await ttsPlayer.pushInt16Mono24k(u8);
+      } else {
+        log('[ws] empty audio chunk');
+      }
     }
   };
-
-  ws.onclose = ()=> { log('[ws] closed'); state = State.IDLE; listening = false; setStatus('Idle'); };
 };
 
 document.getElementById('stop').onclick = async () => {
-  running = false; listening = false;
-  if (ws && ws.readyState === WebSocket.OPEN){ ws.send(JSON.stringify({type:'eos'})); ws.close(); }
+  running = false;
+  listening = false;
+  if (ws && ws.readyState === WebSocket.OPEN){
+    ws.send(JSON.stringify({type:'eos'}));
+    ws.close();
+  }
   try { if (audioCtx) await audioCtx.close(); } catch {}
-  audioCtx = null; ttsPlayer = null;
   document.getElementById('start').disabled = false;
   document.getElementById('stop').disabled = true;
-  document.getElementById('beep').disabled = true;
   setStatus('Idle');
-};
-
-document.getElementById('beep').onclick = async () => {
-  await ensureCtx();
-  // Play 400 Hz beep for 0.3s through the SAME context/output path
-  const o = audioCtx.createOscillator();
-  const g = audioCtx.createGain();
-  g.gain.value = parseFloat(document.getElementById('gain').value);
-  o.frequency.value = 400;
-  o.connect(g).connect(audioCtx.destination);
-  o.start();
-  setTimeout(()=>{ try{o.stop();o.disconnect();g.disconnect();}catch{} }, 300);
 };
 </script>
 </body>
