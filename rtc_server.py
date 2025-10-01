@@ -277,27 +277,6 @@ async def offer(request: web.Request):
     await pc.setLocalDescription(answer)
     return web.json_response({"sdp": pc.localDescription.sdp, "type": pc.localDescription.type})
 
-@routes.get("/")
-async def index(_):
-    return web.Response(text=INDEX_HTML, content_type="text/html")
-
-def _ssl_ctx():
-    if not ENABLE_SSL:
-        return None
-    if not (SSL_CERT and SSL_KEY):
-        raise RuntimeError("ENABLE_SSL=true but SSL_CERT/SSL_KEY not set")
-    ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
-    ctx.load_cert_chain(SSL_CERT, SSL_KEY)
-    return ctx
-
-def main():
-    app = web.Application()
-    app.add_routes(routes)
-    web.run_app(app, host=RTC_HOST, port=RTC_PORT, ssl_context=_ssl_ctx())
-
-if __name__ == "__main__":
-    main()
-
 # ---------- Simple client (served at "/") ----------
 INDEX_HTML = """<!doctype html>
 <html>
@@ -355,3 +334,26 @@ document.getElementById('start').onclick = async () => {
     (", { urls: '%s', username: '%s', credential: '%s' }" % (TURN_URL, TURN_USER, TURN_PASS))
     if (TURN_URL and TURN_USER and TURN_PASS) else ""
 )
+
+@routes.get("/")
+async def index(_):
+    return web.Response(text=INDEX_HTML, content_type="text/html")
+
+def _ssl_ctx():
+    if not ENABLE_SSL:
+        return None
+    if not (SSL_CERT and SSL_KEY):
+        raise RuntimeError("ENABLE_SSL=true but SSL_CERT/SSL_KEY not set")
+    ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+    ctx.load_cert_chain(SSL_CERT, SSL_KEY)
+    return ctx
+
+def main():
+    app = web.Application()
+    app.add_routes(routes)
+    web.run_app(app, host=RTC_HOST, port=RTC_PORT, ssl_context=_ssl_ctx())
+
+if __name__ == "__main__":
+    main()
+
+
