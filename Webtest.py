@@ -16,7 +16,7 @@ logging.basicConfig(level=logging.INFO)
 LOG = logging.getLogger("ws_gateway")
 
 # Minimum chunk size Whisper should see (200 ms @ 16 kHz float32)
-MIN_SAMPLES = 3200                     # 0.2s * 16000 Hz
+MIN_SAMPLES = 3200*5                    # 0.2s * 16000 Hz
 MIN_BYTES   = MIN_SAMPLES * 4          # float32 = 4 bytes/sample
 
 WHISPER_WS_URL = os.getenv("WHISPER_WS_URL", "ws://127.0.0.1:9090")
@@ -237,3 +237,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
