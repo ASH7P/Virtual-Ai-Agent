@@ -148,23 +148,25 @@ class WhisperBridge:
                 self.current_text = []
 
     async def send_audio(self, pcm_f32_mono_16k: bytes):
-        if self.ws is None:
+        if self.ws is None or not pcm_f32_mono_16k:
             return
         try:
+            # IMPORTANT: bytes => Binary WS frame
             await self.ws.send(pcm_f32_mono_16k)
+
+            # --- metering: log once per ~1s ---
+            t = asyncio.get_event_loop().time()
+            if not hasattr(self, "_meter_bytes"):
+                self._meter_bytes = 0
+                self._meter_last = t
+            self._meter_bytes += len(pcm_f32_mono_16k)
+            if (t - self._meter_last) >= 1.0:
+                kbps = (self._meter_bytes * 8) / 1000.0 / (t - self._meter_last)
+                LOG.info(f"[ingest→whisper] {self._meter_bytes/1024:.1f} KiB sent in {t - self._meter_last:.1f}s (~{kbps:.1f} kbps)")
+                self._meter_bytes = 0
+                self._meter_last = t
         except Exception as e:
             LOG.error(f"[whisper] send error: {e}")
-
-    async def close(self):
-        if self.ws:
-            try:
-                await self.ws.send(b"END_OF_AUDIO")
-            except:
-                pass
-            try:
-                await self.ws.close()
-            except:
-                pass
 
 # --------- Azure TTS → WebRTC track ----------
 class TTSToTrack:
@@ -243,26 +245,26 @@ async def offer(request: web.Request):
         LOG.info("Browser audio track received")
 
         async def forward_audio_to_whisper():
-            frames = 0
-            sent_bytes = 0
-            sr_last = None
-        
-            # buffer for 16 kHz mono, float32 bytes (what the WS sends to Whisper)
+            LOG.info("[ingest] forwarder started")
+            # 20 ms framing @16k: 320 samples * 4 bytes (float32) = 1280 bytes per WS message
+            FRAME_SAMPLES = 320
+            FRAME_BYTES = FRAME_SAMPLES * 4
+
             buf = bytearray()
-            FRAME_SAMPLES = 320            # 20 ms @ 16kHz
-            FRAME_BYTES   = FRAME_SAMPLES * 4  # float32 = 4 bytes per sample
-        
+            frames_sent = 0
+            first_log = True
+
             while True:
                 try:
                     frame = await track.recv()
                 except Exception as e:
                     LOG.info(f"[ingest] audio recv ended: {e}")
                     break
-        
-                # PyAV -> ndarray (dtype varies; shape can be (samples, ch) or (ch, samples))
+
+                # ndarray from PyAV; shape can be (samples, ch) or (ch, samples)
                 arr = frame.to_ndarray()
-        
-                # shape to mono
+
+                # shape -> mono
                 if arr.ndim == 2:
                     if hasattr(frame, "layout") and getattr(frame.layout, "channels", None) and arr.shape[0] == frame.layout.channels:
                         mono = arr[0, :]
@@ -270,8 +272,8 @@ async def offer(request: web.Request):
                         mono = arr[:, 0]
                 else:
                     mono = arr
-        
-                # dtype -> int16
+
+                # dtype normalize -> int16
                 if mono.dtype == np.int16:
                     pcm_s16 = mono
                 elif mono.dtype == np.int32:
@@ -282,48 +284,40 @@ async def offer(request: web.Request):
                     pcm_s16 = np.clip(mono * 32768.0, -32768, 32767).astype(np.int16)
                 else:
                     pcm_s16 = mono.astype(np.int16, copy=False)
-        
-                # sample rate
+
                 sr_in = getattr(frame, "sample_rate", None) or 48000
-                if sr_last != sr_in:
-                    LOG.info(f"[ingest] sr_in={sr_in}, dtype={mono.dtype}, in_samples={pcm_s16.shape[0]}")
-                    sr_last = sr_in
-        
+                if first_log:
+                    LOG.info(f"[ingest] first frame: sr_in={sr_in}, shape={arr.shape}, dtype={arr.dtype}, mono_samples={pcm_s16.shape[0]}")
+                    first_log = False
+
                 # resample -> 16k
+                if pcm_s16.size == 0:
+                    continue
                 pcm16k = resample_linear_int16(pcm_s16.reshape(-1), sr_in, 16000)
-        
+                if pcm16k.size == 0:
+                    continue
+
                 # append as float32 LE
                 buf.extend((pcm16k.astype(np.float32) / 32768.0).tobytes())
-        
-                # send in 20 ms frames (avoid tiny packets that can break backend math)
+
+                # send in fixed 20ms frames
                 while len(buf) >= FRAME_BYTES:
                     payload = bytes(buf[:FRAME_BYTES])
                     del buf[:FRAME_BYTES]
-                    # never send empty
                     if not payload:
                         continue
-                    try:
-                        await whisper.send_audio(payload)
-                        sent_bytes += len(payload)
-                        frames += 1
-                    except Exception as e:
-                        LOG.error(f"[ingest] whisper send error: {e}")
-                        break
-        
-                    if frames % 25 == 0:
-                        LOG.info(f"[ingest] tx≈{sent_bytes/1024:.1f} KiB (frame={FRAME_BYTES}B)")
-        
-            # flush any tail aligned up to a frame (optional: pad with silence)
+                    await whisper.send_audio(payload)
+                    frames_sent += 1
+                    if frames_sent % 25 == 0:
+                        LOG.info(f"[ingest] frames_sent={frames_sent} (frame={FRAME_BYTES}B)")
+
+            # flush tail (pad to full frame to avoid zero-length edge)
             if 0 < len(buf) < FRAME_BYTES:
-                # pad with zeros to full frame to avoid div-by-zero on server side durations
-                padding = FRAME_BYTES - len(buf)
-                buf.extend(b"\x00" * padding)
+                buf.extend(b"\x00" * (FRAME_BYTES - len(buf)))
             if buf:
-                try:
-                    await whisper.send_audio(bytes(buf))
-                    LOG.info(f"[ingest] flushed {len(buf)} bytes")
-                except Exception as e:
-                    LOG.error(f"[ingest] whisper flush error: {e}")
+                await whisper.send_audio(bytes(buf))
+                LOG.info(f"[ingest] flushed tail {len(buf)} bytes")
+
 
 
         asyncio.create_task(forward_audio_to_whisper())
@@ -420,4 +414,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
