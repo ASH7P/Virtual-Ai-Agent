@@ -249,20 +249,39 @@ async def offer(request: web.Request):
 
     @pc.on("track")
     def on_track(track):
-        if track.kind == "audio":
-            LOG.info("Browser audio track received")
-            # Wrap the incoming audio and forward to Whisper
-            mic_wrapper = BrowserMicToWhisper(track, whisper.send_audio)
-
-            async def pump():
-                # Continuously pull frames to trigger our wrapper's recv()
-                while True:
-                    try:
-                        await mic_wrapper.recv()
-                    except Exception:
-                        break
-
-            asyncio.create_task(pump())
+        if track.kind != "audio":
+            return
+    
+        LOG.info("Browser audio track received")
+    
+        async def forward_audio_to_whisper():
+            first = True
+            while True:
+                try:
+                    frame = await track.recv()  # AudioFrame from aiortc (decoded)
+                except Exception as e:
+                    LOG.info(f"audio recv ended: {e}")
+                    break
+    
+                # int16 PCM from the frame
+                # av may return shape (samples,) or (channels, samples)
+                pcm = frame.to_ndarray(format="s16")
+                if pcm.ndim == 2:            # (channels, samples)
+                    pcm_s16 = pcm[0, :]      # take mono (first channel)
+                else:                         # (samples,)
+                    pcm_s16 = pcm
+    
+                sr_in = frame.sample_rate or 48000
+                if first:
+                    LOG.info(f"Incoming audio: sr_in={sr_in}, samples={pcm_s16.shape[0]}")
+                    first = False
+    
+                # resample to 16k and send as float32 little-endian bytes
+                pcm16k = resample_linear_int16(pcm_s16.reshape(-1), sr_in, 16000)
+                pcmf32 = float32_from_int16(pcm16k).tobytes()
+                await whisper.send_audio(pcmf32)
+    
+        asyncio.create_task(forward_audio_to_whisper())
 
     @pc.on("connectionstatechange")
     async def _on_state():
@@ -355,5 +374,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
