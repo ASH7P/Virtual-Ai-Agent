@@ -212,19 +212,19 @@ async def offer(request: web.Request):
     params = await request.json()
     offer = RTCSessionDescription(sdp=params["sdp"], type=params["type"])
 
+    # 1) Create the PeerConnection for THIS offer
     pc = RTCPeerConnection(configuration=_rtc_config())
     pcs.add(pc)
     LOG.info("PeerConnection created")
 
-    # Outbound audio (TTS → browser)
+    # 2) Outbound audio (TTS -> browser)
     tts_track = OutboundAudioTrack(sample_rate=48000)
     pc.addTrack(tts_track)
 
-    # Bridge to Whisper
+    # 3) Whisper bridge (WS) + LLM + TTS
     whisper = WhisperBridge(WHISPER_WS_URL)
     await whisper.connect()
 
-    # Text agent (your existing class)
     llm = LLM_Client(system_prompt=SYSTEM_PROMPT)
     tts = TTSToTrack(tts_track, playback_rate=48000)
 
@@ -237,23 +237,20 @@ async def offer(request: web.Request):
 
     whisper.on_eos = on_eos
 
+    # 4) Register the on_track handler ON THIS pc (MUST be inside offer)
     @pc.on("track")
     def on_track(track):
         if track.kind != "audio":
             return
-
         LOG.info("Browser audio track received")
 
         async def forward_audio_to_whisper():
             LOG.info("[ingest] forwarder started")
-            # 20 ms framing @16k: 320 samples * 4 bytes (float32) = 1280 bytes per WS message
-            FRAME_SAMPLES = 320
-            FRAME_BYTES = FRAME_SAMPLES * 4
-
+            FRAME_SAMPLES = 320      # 20 ms @16k
+            FRAME_BYTES   = 320 * 4  # float32
             buf = bytearray()
             frames_sent = 0
             first_log = True
-
             while True:
                 try:
                     frame = await track.recv()
@@ -261,10 +258,7 @@ async def offer(request: web.Request):
                     LOG.info(f"[ingest] audio recv ended: {e}")
                     break
 
-                # ndarray from PyAV; shape can be (samples, ch) or (ch, samples)
                 arr = frame.to_ndarray()
-
-                # shape -> mono
                 if arr.ndim == 2:
                     if hasattr(frame, "layout") and getattr(frame.layout, "channels", None) and arr.shape[0] == frame.layout.channels:
                         mono = arr[0, :]
@@ -273,7 +267,6 @@ async def offer(request: web.Request):
                 else:
                     mono = arr
 
-                # dtype normalize -> int16
                 if mono.dtype == np.int16:
                     pcm_s16 = mono
                 elif mono.dtype == np.int32:
@@ -290,38 +283,33 @@ async def offer(request: web.Request):
                     LOG.info(f"[ingest] first frame: sr_in={sr_in}, shape={arr.shape}, dtype={arr.dtype}, mono_samples={pcm_s16.shape[0]}")
                     first_log = False
 
-                # resample -> 16k
                 if pcm_s16.size == 0:
                     continue
                 pcm16k = resample_linear_int16(pcm_s16.reshape(-1), sr_in, 16000)
                 if pcm16k.size == 0:
                     continue
 
-                # append as float32 LE
                 buf.extend((pcm16k.astype(np.float32) / 32768.0).tobytes())
 
-                # send in fixed 20ms frames
                 while len(buf) >= FRAME_BYTES:
-                    payload = bytes(buf[:FRAME_BYTES])
-                    del buf[:FRAME_BYTES]
-                    if not payload:
-                        continue
-                    await whisper.send_audio(payload)
-                    frames_sent += 1
-                    if frames_sent % 25 == 0:
-                        LOG.info(f"[ingest] frames_sent={frames_sent} (frame={FRAME_BYTES}B)")
+                    payload = bytes(buf[:FRAME_BYTES]); del buf[:FRAME_BYTES]
+                    if payload:
+                        await whisper.send_audio(payload)
+                        frames_sent += 1
+                        if frames_sent % 25 == 0:
+                            LOG.info(f"[ingest] frames_sent={frames_sent} (frame={FRAME_BYTES}B)")
 
-            # flush tail (pad to full frame to avoid zero-length edge)
             if 0 < len(buf) < FRAME_BYTES:
                 buf.extend(b"\x00" * (FRAME_BYTES - len(buf)))
             if buf:
                 await whisper.send_audio(bytes(buf))
                 LOG.info(f"[ingest] flushed tail {len(buf)} bytes")
 
-
-
         asyncio.create_task(forward_audio_to_whisper())
 
+    LOG.info("on_track handler registered")  # <-- you should see this
+
+    # 5) Connection state cleanup (also inside offer so it closes the right pc)
     @pc.on("connectionstatechange")
     async def _on_state():
         LOG.info(f"pc.state={pc.connectionState}")
@@ -330,10 +318,12 @@ async def offer(request: web.Request):
             await pc.close()
             pcs.discard(pc)
 
+    # 6) Finish SDP handshake
     await pc.setRemoteDescription(offer)
     answer = await pc.createAnswer()
     await pc.setLocalDescription(answer)
     return web.json_response({"sdp": pc.localDescription.sdp, "type": pc.localDescription.type})
+
 
 # ---------- Simple client (served at "/") ----------
 INDEX_HTML = """<!doctype html>
