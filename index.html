@@ -95,25 +95,18 @@ class PCM24Player {
 let ttsPlayer;
 
 // --- mic worklet (downsample to ~16k, emit 20ms frames); gated by `listening` ---
-async function setupMic(){
-  audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-  await audioCtx.audioWorklet.addModule(URL.createObjectURL(new Blob([`
+async function setupMic(ctx){
+  // Worklet on the SAME context
+  await ctx.audioWorklet.addModule(URL.createObjectURL(new Blob([`
     class MicProcessor extends AudioWorkletProcessor {
-      constructor(){
-        super();
-        this.decim = Math.max(1, Math.round(sampleRate / 16000)); // e.g. 48000->3
-      }
+      constructor(){ super(); this.decim = Math.max(1, Math.round(sampleRate / 16000)); }
       process(inputs){
-        const input = inputs[0];
-        if (!input || input.length === 0) return true;
-        const ch0 = input[0];
-        if (!ch0) return true;
-        // downsample by decimation (good enough for STT)
+        const input = inputs[0]; if (!input || input.length === 0) return true;
+        const ch0 = input[0]; if (!ch0) return true;
         const step = this.decim;
         const outLen = Math.floor(ch0.length / step);
         const f32_16k = new Float32Array(outLen);
         for (let i=0,j=0; j<outLen; i+=step, j++) f32_16k[j] = ch0[i];
-        // slice into 20ms frames (320 samples @16k)
         const FRAME = 320;
         for (let idx = 0; idx < f32_16k.length; idx += FRAME) {
           const slice = f32_16k.subarray(idx, Math.min(f32_16k.length, idx + FRAME));
@@ -126,16 +119,15 @@ async function setupMic(){
   `], {type:'application/javascript'})));
 
   const stream = await navigator.mediaDevices.getUserMedia({audio:true, video:false});
-  const src = audioCtx.createMediaStreamSource(stream);
-  micNode = new AudioWorkletNode(audioCtx, 'mic-proc');
-
+  const src = ctx.createMediaStreamSource(stream);
+  micNode = new AudioWorkletNode(ctx, 'mic-proc');
   micNode.port.onmessage = (e)=>{
     if (!listening || !ws || ws.readyState !== WebSocket.OPEN) return;
     const f32 = e.data;                 // Float32Array (16k mono)
-    ws.send(f32.buffer);                // send binary
+    ws.send(f32.buffer);                // binary to gateway
   };
 
-  // we don't output mic to speakers; keeping the node connected keeps the graph alive
+  // Keep graph alive (not routing mic to speakers)
   src.connect(micNode);
 }
 
@@ -187,12 +179,18 @@ document.getElementById('start').onclick = async () => {
   document.getElementById('start').disabled = true;
   document.getElementById('stop').disabled = false;
 
-  // init audio + tts player
-  ttsPlayer = new PCM24Player(audioCtx || new (window.AudioContext || window.webkitAudioContext)());
-  await setupMic();
+  // 1) Create ONE AudioContext and make sure it is resumed by the click
+  audioCtx = new (window.AudioContext || window.webkitAudioContext)({ latencyHint: 'interactive' });
+  try { await audioCtx.resume(); } catch {}
+
+  // 2) Init TTS player on the SAME context
+  ttsPlayer = new PCM24Player(audioCtx);
   await ttsPlayer.init();
 
-  // connect WS to gateway (same host via tunnel or HTTPS proxy)
+  // 3) Setup mic on the SAME context (see updated function below)
+  await setupMic(audioCtx);
+
+  // 4) Connect WS
   const url = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.hostname + ':8765';
   ws = new WebSocket(url);
   ws.binaryType = 'arraybuffer';
@@ -207,9 +205,7 @@ document.getElementById('start').onclick = async () => {
     if (typeof ev.data === 'string'){
       const msg = JSON.parse(ev.data);
       switch (msg.type) {
-        case 'ack':
-          log('[ws] ack');
-          break;
+        case 'ack': log('[ws] ack'); break;
         case 'partial':
           if (state === State.LISTENING) {
             liveText = msg.text || '';
@@ -217,28 +213,23 @@ document.getElementById('start').onclick = async () => {
           }
           break;
         case 'assistant_text':
-          // Treat this as EOS boundary: commit your last user text, pause mic
-          if (liveText) {
-            appendUserLine(liveText);
-            liveText = "";
-            liveEl.textContent = "";
-          }
+          if (liveText) { appendUserLine(liveText); liveText = ""; liveEl.textContent = ""; }
           beginThinking();
           appendBotLine(msg.text || '');
           break;
         case 'tts_start':
+          // Ensure context is running before playback
+          try { await audioCtx.resume(); } catch {}
           beginSpeaking();
           break;
         case 'tts_end':
           endSpeakingThenListen();
           break;
-        default:
-          // ignore
-          break;
       }
     } else {
       // Binary = Azure TTS PCM 24k int16
       if (state !== State.SPEAKING) beginSpeaking();
+      try { await audioCtx.resume(); } catch {}
       const buf = new Uint8Array(ev.data);
       await ttsPlayer.pushInt16Mono24k(buf);
     }
@@ -256,7 +247,7 @@ document.getElementById('stop').onclick = async () => {
   running = false;
   listening = false;
   if (ws && ws.readyState === WebSocket.OPEN){
-    ws.send(JSON.stringify({type:'eos'})); // optional
+    ws.send(JSON.stringify({type:'eos'}));
     ws.close();
   }
   try { if (audioCtx) await audioCtx.close(); } catch {}
