@@ -258,30 +258,41 @@ async def offer(request: web.Request):
             first = True
             while True:
                 try:
-                    frame = await track.recv()  # AudioFrame from aiortc (decoded)
+                    frame = await track.recv()
                 except Exception as e:
                     LOG.info(f"audio recv ended: {e}")
                     break
-    
-                # int16 PCM from the frame
-                # av may return shape (samples,) or (channels, samples)
-                pcm = frame.to_ndarray(format="s16")
-                if pcm.ndim == 2:            # (channels, samples)
-                    pcm_s16 = pcm[0, :]      # take mono (first channel)
-                else:                         # (samples,)
-                    pcm_s16 = pcm
-    
+        
+                # Get samples as ndarray (dtype follows frame.format: s16 -> int16, flt -> float32, etc.)
+                arr = frame.to_ndarray()                 # shape: (channels, samples) or (samples,)
+                # Mono: take first channel if multi-channel
+                if arr.ndim == 2:
+                    arr = arr[0, :]
+        
+                # Normalize to int16
+                if arr.dtype == np.int16:
+                    pcm_s16 = arr
+                elif arr.dtype == np.int32:
+                    # downscale to int16
+                    pcm_s16 = (arr >> 16).astype(np.int16)
+                elif arr.dtype == np.float32:
+                    pcm_s16 = np.clip(arr * 32768.0, -32768, 32767).astype(np.int16)
+                elif arr.dtype == np.float64:
+                    pcm_s16 = np.clip(arr * 32768.0, -32768, 32767).astype(np.int16)
+                else:
+                    # fallback
+                    pcm_s16 = arr.astype(np.int16)
+        
                 sr_in = frame.sample_rate or 48000
                 if first:
-                    LOG.info(f"Incoming audio: sr_in={sr_in}, samples={pcm_s16.shape[0]}")
+                    LOG.info(f"Incoming audio: sr_in={sr_in}, dtype={arr.dtype}, samples={arr.shape[0]}")
                     first = False
-    
-                # resample to 16k and send as float32 little-endian bytes
+        
+                # Resample to 16k and send as float32 mono (what your Whisper server expects)
                 pcm16k = resample_linear_int16(pcm_s16.reshape(-1), sr_in, 16000)
-                pcmf32 = float32_from_int16(pcm16k).tobytes()
+                pcmf32 = (pcm16k.astype(np.float32) / 32768.0).tobytes()
                 await whisper.send_audio(pcmf32)
-    
-        asyncio.create_task(forward_audio_to_whisper())
+
 
     @pc.on("connectionstatechange")
     async def _on_state():
@@ -374,6 +385,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
