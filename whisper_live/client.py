@@ -60,6 +60,9 @@ class VoiceSession:
 
     async def _push_tts_audio(self, f32_48k: np.ndarray):
         await self.rtc.send_tts_pcm_f32_48k(f32_48k)
+        self._tts_bytes = getattr(self, "_tts_bytes", 0) + f32_48k.nbytes
+        if self._tts_bytes % (48_000 * 4) < f32_48k.nbytes:  # ~every 1s at 48k f32 mono
+            self._logger(f"[RTC] TTS pushed ~{self._tts_bytes/192000:.1f}s total")
 
     async def close(self):
         await self.rtc.close()

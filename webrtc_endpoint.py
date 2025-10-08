@@ -62,6 +62,10 @@ class _TTSSourceTrack(MediaStreamTrack):
         frame.pts = self._ts
         self._ts += self._chunk
 
+        self._sent = getattr(self, "_sent", 0) + 1
+        if self._sent % 50 == 0:
+            self._logger(f"[RTC] downlink frames sent: {self._sent}")
+
         return frame
 
 class WebRTCEndpoint:
