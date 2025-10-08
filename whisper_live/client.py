@@ -25,10 +25,6 @@ from audio_resample import resample_f32_mono, float32_to_int16
 from webrtc_endpoint import WebRTCEndpoint
 from signaling_bridge import SignalingServer
 
-# Initialize the LLM client with a system prompt
-track = AzureTTSTrack()
-
-
 llm_client = LLM_Client(system_prompt=SYSTEM_PROMPT)
 
 CHUNK_16K = 4096  # what the Whisper server expects per packet

@@ -32,6 +32,13 @@ class AzureTTSTrack(MediaStreamTrack):
         frame.sample_rate = self.sample_rate
         frame.planes[0].update(samples.tobytes())
         return frame
+    
+    async def handle_tts_chunk(self, pcm_bytes_24k_le: bytes):
+        # Example if Azure returns 24 kHz s16 mono PCM:
+        arr = np.frombuffer(pcm_bytes_24k_le, dtype="<i2").astype(np.float32) / 32768.0
+        f32_48k = resample_f32_mono(arr, 24000, WEBRTC_AUDIO_RATE)
+        if self.on_pcm_f32:
+            await self.on_pcm_f32(f32_48k)
 
 endpoint = os.getenv("ENDPOINT_URL", "https://ttsmodel3.openai.azure.com/")
 # deployment = os.getenv("DEPLOYMENT_NAME", "gpt-5-nano")
@@ -61,13 +68,6 @@ class LLM_Client:
 
         self.on_pcm_f32 = None  # set by client.py to push into WebRTC
 
-    async def handle_tts_chunk(self, pcm_bytes_24k_le: bytes):
-        # Example if Azure returns 24 kHz s16 mono PCM:
-        arr = np.frombuffer(pcm_bytes_24k_le, dtype="<i2").astype(np.float32) / 32768.0
-        f32_48k = resample_f32_mono(arr, 24000, WEBRTC_AUDIO_RATE)
-        if self.on_pcm_f32:
-            await self.on_pcm_f32(f32_48k)
-
     def generate_reply(self, user_input: str) -> str:
         self.history.append({"role": "user", "content": user_input})
 
@@ -87,7 +87,7 @@ class LLM_Client:
         self.history.append({"role": "assistant", "content": message})
         return message
 
-    async def stream_tts(self, text: str, track, instructions: str):
+    async def stream_tts(self, text: str, track: AzureTTSTrack, instructions: str):
         """
         Stream Azure TTS as PCM and forward to the provided track (WebRTC).
         No local playback. The 'track' MUST expose: await track.handle_tts_chunk(pcm_bytes, rate=int)
