@@ -87,34 +87,22 @@ class LLM_Client:
         self.history.append({"role": "assistant", "content": message})
         return message
 
-    async def stream_tts(self, text: str, track: AzureTTSTrack, instructions: str):
+    async def stream_tts(self, text: str, track, instructions: str):
         """
-        Stream Azure TTS as PCM directly to local speakers.
-        Signature unchanged so server.py doesn't need edits.
-        The 'track' argument is intentionally ignored for this local demo.
+        Stream Azure TTS as PCM and forward to the provided track (WebRTC).
+        No local playback. The 'track' MUST expose: await track.handle_tts_chunk(pcm_bytes, rate=int)
         """
-        _ = track  # keep signature; not used for local speaker playback
+        # Choose raw PCM so we don't have to decode
+        out_rate = 24000  # Azure's pcm default for mini-tts; adjust if you request a different format
 
-        # Azure's TTS PCM default samplerate is typically 24000 Hz for gpt-4o-mini-tts
-        playback_rate = 24000
-        stream = sd.OutputStream(
-            samplerate=playback_rate,
-            channels=1,
-            dtype="int16",
-            blocksize=0,
-        )
-        stream.start()
-        try:
-            async with self.tts_client.audio.speech.with_streaming_response.create(
-                model=self.tts_deployment,
-                voice="onyx",
-                input=text,
-                instructions=instructions,
-                response_format="pcm",   # 16-bit PCM; no sample_rate arg here
-            ) as response:
-                async for chunk in response.iter_bytes():
-                    samples = np.frombuffer(chunk, dtype=np.int16).reshape(-1, 1)
-                    stream.write(samples)
-        finally:
-            stream.stop()
-            stream.close()
+        async with self.tts_client.audio.speech.with_streaming_response.create(
+            model=self.tts_deployment,
+            voice="onyx",                # your hardcoded voice
+            input=text,
+            instructions=instructions,
+            response_format="pcm",       # 16-bit, mono PCM
+        ) as response:
+            async for chunk in response.iter_bytes():
+                # chunk is bytes of int16 mono @ ~24kHz from Azure
+                # forward to session track; track will resample to 48k and push to WebRTC
+                await track.handle_tts_chunk(chunk, rate=out_rate)
