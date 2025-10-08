@@ -64,7 +64,7 @@ class _TTSSourceTrack(MediaStreamTrack):
 
         self._sent = getattr(self, "_sent", 0) + 1
         if self._sent % 50 == 0:
-            self._logger(f"[RTC] downlink frames sent: {self._sent}")
+            print(f"[RTC] downlink frames sent: {self._sent}")
 
         return frame
 
