@@ -7,6 +7,7 @@ from aiortc import RTCPeerConnection, RTCSessionDescription, MediaStreamTrack
 from aiortc.rtcconfiguration import RTCConfiguration, RTCIceServer
 from aiortc.rtcrtpsender import RTCRtpSender
 from av.audio.resampler import AudioResampler
+from fractions import Fraction
 
 from config_rtc import ICE_SERVERS, WEBRTC_AUDIO_RATE
 
@@ -28,18 +29,39 @@ class _TTSSourceTrack(MediaStreamTrack):
     kind = "audio"
     def __init__(self, rate=WEBRTC_AUDIO_RATE):
         super().__init__()
-        self._queue = asyncio.Queue()
         self._rate = rate
+        self._ts = 0  # running timestamp in samples
+        self._buf = np.empty(0, dtype=np.float32)  # f32 mono ring buffer
+        self._chunk = int(self._rate * 0.020)  # 20 ms -> 960 at 48k
 
     async def push_f32_mono_48k(self, f32: np.ndarray):
-        await self._queue.put(f32.astype(np.float32))
+        # append to internal buffer
+        if f32 is None or f32.size == 0:
+            return
+        # ensure 1-D float32
+        f32 = f32.astype(np.float32).reshape(-1)
+        self._buf = np.concatenate((self._buf, f32))
 
     async def recv(self):
-        samples = await self._queue.get()
-        s16 = (np.clip(samples, -1.0, 1.0) * 32767.0).astype("<i2").tobytes()
-        frame = av.AudioFrame(format="s16", layout="mono", samples=len(samples))
+        # wait until we have at least one 20ms packet
+        while self._buf.size < self._chunk:
+            await asyncio.sleep(0.005)
+
+        # slice one packet
+        samples_f32 = self._buf[:self._chunk]
+        self._buf = self._buf[self._chunk:]
+
+        # f32 [-1,1] -> s16 little-endian
+        s16 = (np.clip(samples_f32, -1.0, 1.0) * 32767.0).astype("<i2").tobytes()
+
+        # build frame with timestamps
+        frame = av.AudioFrame(format="s16", layout="mono", samples=self._chunk)
         frame.sample_rate = self._rate
         frame.planes[0].update(s16)
+        frame.time_base = Fraction(1, self._rate)
+        frame.pts = self._ts
+        self._ts += self._chunk
+
         return frame
 
 class WebRTCEndpoint:

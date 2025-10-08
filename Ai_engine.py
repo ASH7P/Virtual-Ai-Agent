@@ -33,7 +33,7 @@ class AzureTTSTrack(MediaStreamTrack):
         frame.planes[0].update(samples.tobytes())
         return frame
     
-    async def handle_tts_chunk(self, pcm_bytes_24k_le: bytes):
+    async def handle_tts_chunk(self, pcm_bytes_24k_le: bytes, rate: int):
         # Example if Azure returns 24 kHz s16 mono PCM:
         arr = np.frombuffer(pcm_bytes_24k_le, dtype="<i2").astype(np.float32) / 32768.0
         f32_48k = resample_f32_mono(arr, 24000, WEBRTC_AUDIO_RATE)
