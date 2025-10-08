@@ -4,10 +4,25 @@ import json
 import numpy as np
 import av
 from aiortc import RTCPeerConnection, RTCSessionDescription, MediaStreamTrack
+from aiortc.rtcconfiguration import RTCConfiguration, RTCIceServer
 from aiortc.rtcrtpsender import RTCRtpSender
 from av.audio.resampler import AudioResampler
 
 from config_rtc import ICE_SERVERS, OPUS_BITRATE, OPUS_PTIME_MS, WEBRTC_AUDIO_RATE, MONO
+
+def _make_rtc_config():
+    servers = []
+    # ICE_SERVERS is your list of dicts like {"urls": "stun:stun.l.google.com:19302", ...}
+    for s in ICE_SERVERS:
+        if isinstance(s, dict):
+            servers.append(RTCIceServer(
+                urls=s.get("urls"),
+                username=s.get("username"),
+                credential=s.get("credential"),
+            ))
+        elif isinstance(s, str):
+            servers.append(RTCIceServer(urls=s))
+    return RTCConfiguration(iceServers=servers)
 
 class _TTSSourceTrack(MediaStreamTrack):
     kind = "audio"
@@ -34,7 +49,7 @@ class WebRTCEndpoint:
       - sends TTS via an internal audio track (we encode to Opus automatically)
     """
     def __init__(self, on_uplink_frame=None, logger=print):
-        self.pc = RTCPeerConnection(configuration={"iceServers": ICE_SERVERS})
+        self.pc = RTCPeerConnection(configuration=_make_rtc_config())
         self.on_uplink_frame = on_uplink_frame
         self._logger = logger
         self._resampler_48 = AudioResampler(format="s16", layout="mono", rate=WEBRTC_AUDIO_RATE)
