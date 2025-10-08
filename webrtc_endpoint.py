@@ -8,7 +8,7 @@ from aiortc.rtcconfiguration import RTCConfiguration, RTCIceServer
 from aiortc.rtcrtpsender import RTCRtpSender
 from av.audio.resampler import AudioResampler
 
-from config_rtc import ICE_SERVERS, OPUS_BITRATE, OPUS_PTIME_MS, WEBRTC_AUDIO_RATE, MONO
+from config_rtc import ICE_SERVERS, WEBRTC_AUDIO_RATE
 
 def _make_rtc_config():
     servers = []
