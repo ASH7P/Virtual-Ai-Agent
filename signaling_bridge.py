@@ -42,6 +42,23 @@ class SignalingServer:
             await self._ws.send_str(json.dumps({"type": "ice", "candidate": candidate}))
 
     def run(self):
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
         app = web.Application()
         app.router.add_get("/ws", self._ws_handler)
-        web.run_app(app, host=SIGNALING_HOST, port=SIGNALING_PORT)
+
+        async def _start():
+            runner = web.AppRunner(app)
+            await runner.setup()
+            site = web.TCPSite(runner, host=SIGNALING_HOST, port=SIGNALING_PORT)
+            await site.start()
+            self.logger(f"[SIGNALING] ws://{SIGNALING_HOST}:{SIGNALING_PORT}/ws ready")
+            # keep running
+            while True:
+                await asyncio.sleep(3600)
+
+        try:
+            loop.run_until_complete(_start())
+        finally:
+            loop.close()
