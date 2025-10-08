@@ -70,8 +70,13 @@ class WebRTCEndpoint:
                 frame = await track.recv()  # av.AudioFrame (various rates)
                 frame.sample_rate = getattr(frame, "sample_rate", WEBRTC_AUDIO_RATE)
                 for f in self._resampler_48.resample(frame):
-                    s16 = np.frombuffer(f.planes[0].to_bytes(), dtype="<i2")
-                    f32 = (s16.astype(np.float32) / 32768.0).clip(-1, 1)
+                    # Get int16 samples as numpy
+                    arr = f.to_ndarray()                 # shape: (samples,) or (channels, samples)
+                    if arr.ndim == 2:                    # if (channels, samples)
+                        arr = arr[0]                     # mono layout -> take channel 0
+                    if arr.dtype != np.int16:
+                        arr = arr.astype(np.int16)
+                    f32 = (arr.astype(np.float32) / 32768.0).clip(-1.0, 1.0)
                     if self.on_uplink_frame:
                         await self.on_uplink_frame(f32)  # f32 mono @ 48k
         except Exception as e:

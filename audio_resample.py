@@ -13,15 +13,26 @@ def float32_to_int16(x: np.ndarray) -> np.ndarray:
 def resample_pcm_s16_mono(pcm_s16: bytes, in_hz: int, out_hz: int) -> bytes:
     if in_hz == out_hz:
         return pcm_s16
-    arr = np.frombuffer(pcm_s16, dtype="<i2")
-    frame_in = av.AudioFrame(format="s16", layout="mono", samples=len(arr))
-    frame_in.planes[0].update(pcm_s16)
+
+    # int16 mono → AV frame
+    samples = len(pcm_s16) // 2  # 2 bytes per int16 sample
+    frame_in = av.AudioFrame(format="s16", layout="mono", samples=samples)
     frame_in.sample_rate = in_hz
+    frame_in.planes[0].update(pcm_s16)
+
+    # Resample
     resampler = AudioResampler(format="s16", layout="mono", rate=out_hz)
-    out_bytes = bytearray()
+    out_chunks = []
     for f in resampler.resample(frame_in):
-        out_bytes += f.planes[0].to_bytes()
-    return bytes(out_bytes)
+        # Robust across PyAV versions
+        arr = f.to_ndarray()
+        if arr.ndim == 2:  # (channels, samples) → mono
+            arr = arr[0]
+        if arr.dtype != np.int16:
+            arr = arr.astype(np.int16)
+        out_chunks.append(arr.tobytes())
+
+    return b"".join(out_chunks)
 
 def resample_f32_mono(pcm_f32: np.ndarray, in_hz: int, out_hz: int) -> np.ndarray:
     if in_hz == out_hz:
