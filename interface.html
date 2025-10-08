@@ -1,0 +1,409 @@
+<!DOCTYPE html>
+<html class="dark" lang="en"><head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<title>Voice AI Agent</title>
+<link href="https://fonts.googleapis.com" rel="preconnect"/>
+<link crossorigin="" href="https://fonts.gstatic.com" rel="preconnect"/>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;700;900&amp;display=swap" rel="stylesheet"/>
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined" rel="stylesheet"/>
+<script src="https://cdn.tailwindcss.com?plugins=forms,container-queries"></script>
+<script>
+        tailwind.config = {
+            darkMode: "class",
+            theme: {
+                extend: {
+                    colors: {
+                        "primary": "#b613ec",
+                        "background-light": "#f8f6f8",
+                        "background-dark": "#1d1022",
+                    },
+                    fontFamily: {
+                        "display": ["Inter"]
+                    },
+                    borderRadius: {
+                        "DEFAULT": "0.5rem",
+                        "lg": "1rem",
+                        "xl": "1.5rem",
+                        "full": "9999px"
+                    },
+                    keyframes: {
+                        'ripple': {
+                            '0%': { transform: 'scale(.8)', opacity: '1' },
+                            '100%': { transform: 'scale(2.4)', opacity: '0' }
+                        },
+                        'speech-pulse': {
+                          '0%, 100%': { transform: 'scale(1)', filter: 'brightness(1)' },
+                          '50%': { transform: 'scale(1.15)', filter: 'brightness(1.5)' }
+                        },
+                        'light-sweep': {
+                            '0%': { transform: 'translateY(-100%) skewY(-20deg)'},
+                            '100%': { transform: 'translateY(200%) skewY(-20deg)'}
+                        }
+                    },
+                    animation: {
+                        'ripple': 'ripple 1s linear infinite',
+                        'speech-pulse': 'speech-pulse 1.2s cubic-bezier(0.4, 0, 0.6, 1) infinite',
+                        'light-sweep': 'light-sweep 4s ease-in-out infinite'
+                    }
+                },
+            },
+        }
+    </script>
+<style>
+        body {
+            font-family: 'Inter', sans-serif;
+        }
+        .glass-card {
+            background: rgba(255, 255, 255, 0.1);
+            -webkit-backdrop-filter: blur(20px);
+            backdrop-filter: blur(20px);
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            overflow: hidden;}
+        .dark .glass-card {
+            background: rgba(45, 26, 56, 0.4);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+        .gradient-glow {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            width: 80%;
+            height: 80%;
+            background: radial-gradient(circle, #00f2fe80, #fa709a80, #b613ec80);
+            filter: blur(120px);
+            z-index: -1;
+        }
+        .light-reflection {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 50%;
+            height: 100%;
+            background: linear-gradient(to right, rgba(255,255,255,0) 0%, rgba(255,255,255,0.15) 50%, rgba(255,255,255,0) 100%);
+            transform: translateY(-100%) skewY(-20deg);
+            opacity: 0.7;
+            pointer-events: none;
+        }
+        .conversation-feed {
+            height: 250px;
+            overflow-y: auto;
+            perspective: 2px;
+        }
+        .message-bubble {
+            transform: translateZ(0);
+            transition: transform 0.3s ease-out;
+        }
+        .message-bubble.user {
+             transform: translateZ(-1px) scale(1.5);
+             background-color: #b613ec;
+             color: white;
+        }
+        .message-bubble.ai {
+            transform: translateZ(-0.5px) scale(1.25);
+            background-color: rgba(255,255,255,0.1);
+        }
+        .mic-button {
+            position: relative;
+            overflow: hidden;
+        }
+        .mic-button::after {
+            content: '';
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            width: 100%;
+            height: 100%;
+            border-radius: 9999px;
+            background-color: rgba(255, 255, 255, 0.7);
+            transform: translate(-50%,-50%) scale(0);
+            opacity: 0;
+            transition: transform 0.5s, opacity 0.7s;
+        }
+        .mic-button:hover::after {
+            transform: translate(-50%,-50%) scale(2);
+            opacity: 1;
+            transition: transform 0.5s, opacity 0s;
+        }
+        .mic-button:active::after {
+            transform: translate(-50%,-50%) scale(0);
+            opacity: 0;
+            transition: transform 0s, opacity 0s;
+        }
+    </style>
+</head>
+<body class="bg-background-light dark:bg-background-dark font-display text-white transition-colors duration-300">
+<div class="relative min-h-screen flex items-center justify-center p-4 overflow-hidden">
+<div class="gradient-glow"></div>
+<div class="relative w-full max-w-md rounded-xl glass-card shadow-2xl">
+<div class="light-reflection animate-light-sweep"></div>
+<header class="flex items-center justify-between p-4 border-b border-white/10 relative z-10">
+<div class="flex items-center gap-3">
+<div class="w-6 h-6 bg-gradient-to-br from-teal-400 via-sky-500 to-fuchsia-500 rounded-full flex items-center justify-center">
+<svg class="w-4 h-4 text-white" fill="none" viewBox="0 0 48 48" xmlns="http://www.w3.org/2000/svg"><path d="M6 6H42L36 24L42 42H6L12 24L6 6Z" fill="currentColor"></path></svg>
+</div>
+<h1 class="font-bold text-base text-white/90">Voice AI Agent</h1>
+</div>
+<div class="flex items-center gap-4">
+<div class="flex items-center gap-2">
+<span class="relative flex h-2 w-2">
+<span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-green-400 opacity-75"></span>
+<span class="relative inline-flex rounded-full h-2 w-2 bg-green-500"></span>
+</span>
+<span class="text-xs font-medium text-green-400">Online</span>
+</div>
+<button class="px-3 py-1 text-xs font-bold rounded bg-white/10 hover:bg-white/20 transition-colors text-white/80">End</button>
+</div>
+</header>
+<div class="conversation-feed p-6 space-y-4">
+<div class="message-bubble ai self-start max-w-xs rounded-lg p-3 text-sm">
+<p>Hello! How can I assist you today?</p>
+</div>
+<div class="message-bubble user self-end max-w-xs rounded-lg p-3 text-sm text-right ml-auto">
+<p>What's the weather like in San Francisco?</p>
+</div>
+<div class="message-bubble ai self-start max-w-xs rounded-lg p-3 text-sm">
+<p>One moment... The weather in San Francisco is currently sunny with a high of 72 degrees Fahrenheit.</p>
+</div>
+</div>
+<div class="p-6 space-y-6 flex flex-col items-center border-t border-white/10 relative z-10 bg-background-dark/30">
+<div class="relative w-48 h-48 flex items-center justify-center">
+<div class="absolute w-full h-full rounded-full border-4 border-primary/20"></div>
+<div class="absolute w-[85%] h-[85%] rounded-full bg-primary/10 animate-pulse delay-200"></div>
+<div class="absolute w-2/3 h-2/3 rounded-full bg-gradient-to-br from-primary via-fuchsia-500 to-teal-400 shadow-[0_0_30px_10px] shadow-primary/40 animate-speech-pulse"></div>
+</div>
+<div class="w-full space-y-2">
+<div class="flex justify-between items-center text-xs text-white/50 px-1">
+<span>Listening...</span>
+<span>75%</span>
+</div>
+<div class="w-full bg-white/10 rounded-full h-1.5">
+<div class="bg-primary h-1.5 rounded-full transition-all duration-500" style="width: 75%"></div>
+</div>
+</div>
+<div class="flex items-center justify-center gap-6 w-full">
+<button class="p-3 rounded-full bg-white/10 hover:bg-white/20 transition-colors text-white/70">
+<span class="material-symbols-outlined">replay</span>
+</button>
+<button class="mic-button p-5 rounded-full bg-primary shadow-lg shadow-primary/40 ring-4 ring-primary/30 hover:bg-primary/90 transition-all">
+<span class="material-symbols-outlined text-3xl text-white relative z-10">mic</span>
+</button>
+<button class="p-3 rounded-full bg-white/10 hover:bg-white/20 transition-colors text-white/70">
+<span class="material-symbols-outlined">settings</span>
+</button>
+</div>
+</div>
+</div>
+</div>
+
+<script>
+(() => {
+  // ======== CONFIG (edit host only) ========
+  const SIGNALING_URL = (location.protocol === "https:" ? "wss://" : "ws://")
+    + location.host.replace(/:\d+$/, "")       // keep domain/IP
+    + ":8765/ws";                               // your signaling_ws route
+  const ICE_SERVERS = [
+    { urls: "stun:stun.l.google.com:19302" },
+    // Add TURN for production:
+    // { urls: "turn:your.turn.server:3478", username: "USER", credential: "PASS" }
+  ];
+
+  // ======== UI HOOKS ========
+  const feedEl = document.querySelector(".conversation-feed");                  // feed container
+  const micBtn = document.querySelector(".mic-button");                         // big purple mic
+  const onlineChip = document.querySelector("header .text-green-400");          // "Online" text
+  const progressTxt = document.querySelector(".w-full .flex span:first-child"); // "Listening."
+  const progressBar = document.querySelector(".w-full .bg-primary");            // % bar
+  const endBtn = document.querySelector("header button");                       // "End" button
+
+  // Add a hidden audio tag to play remote TTS
+  const remoteAudio = document.createElement("audio");
+  remoteAudio.autoplay = true;
+  remoteAudio.playsInline = true;
+  document.body.appendChild(remoteAudio);
+
+  // ======== STATE ========
+  let pc = null;
+  let ws = null;
+  let localStream = null;
+  let connected = false;
+  let statsTimer = null;
+
+  // ======== Helpers ========
+  const nowAmman = () =>
+    new Date().toLocaleTimeString("ar-JO", { timeZone: "Asia/Amman", hour: "2-digit", minute: "2-digit" });
+
+  function addBubble({ text, who = "ai" }) {
+    const wrap = document.createElement("div");
+    wrap.className = `message-bubble ${who} self-${who === "ai" ? "start" : "end"} max-w-xs rounded-lg p-3 text-sm ${who === "user" ? "text-right ml-auto" : ""}`;
+    const p = document.createElement("p");
+    p.textContent = text;
+    wrap.appendChild(p);
+    feedEl.appendChild(wrap);
+    feedEl.scrollTop = feedEl.scrollHeight;
+  }
+
+  function setStatus(text = "Online", ok = true) {
+    if (onlineChip) {
+      onlineChip.textContent = text;
+      onlineChip.classList.toggle("text-green-400", ok);
+      onlineChip.classList.toggle("text-red-400", !ok);
+    }
+  }
+
+  function setListeningUI(active) {
+    // Pulse on mic when listening
+    micBtn.classList.toggle("ring-4", active);
+    micBtn.classList.toggle("ring-primary/30", active);
+    progressTxt && (progressTxt.textContent = active ? "Listening…" : "Idle");
+    if (progressBar) progressBar.style.width = active ? "100%" : "0%";
+  }
+
+  // Jordan-tuned Arabic phrases (agent is Arabic-only, voice "onyx" handled server-side)
+  const phrases = {
+    greet: "أهلاً وسهلاً! كيف فيني أساعدك اليوم؟",
+    ack: "تمام، لحظة بس…",
+    done: "تمّت. في شي ثاني؟",
+    bye: "يعطيك العافية."
+  };
+
+  // ======== WebRTC connect/disconnect ========
+  async function connect() {
+    if (connected) return;
+
+    // 1) Signaling
+    ws = new WebSocket(SIGNALING_URL);
+    ws.onclose = () => {
+      setStatus("Disconnected", false);
+      setListeningUI(false);
+      connected = false;
+      cleanup();
+    };
+
+    // 2) PeerConnection
+    pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+    pc.onconnectionstatechange = () => {
+      if (pc.connectionState === "connected") {
+        setStatus("Connected", true);
+        setListeningUI(true);
+        connected = true;
+        // Arabic greeting (visual)
+        addBubble({ text: phrases.greet, who: "ai" });
+        // Start lightweight stats (optional)
+        startStats();
+      } else if (pc.connectionState === "failed" || pc.connectionState === "disconnected") {
+        setStatus("Disconnected", false);
+        setListeningUI(false);
+        connected = false;
+        stopStats();
+      }
+    };
+
+    // 3) Remote audio
+    pc.ontrack = (e) => {
+      if (!remoteAudio.srcObject) remoteAudio.srcObject = new MediaStream();
+      remoteAudio.srcObject.addTrack(e.track);
+    };
+
+    // 4) Get mic
+    try {
+      localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+    } catch (err) {
+      setStatus("Mic blocked", false);
+      console.error(err);
+      return;
+    }
+    localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
+
+    // 5) Non-trickle flow: create offer, wait for local ICE to finish, then send offer.
+    const offer = await pc.createOffer({ offerToReceiveAudio: true, offerToReceiveVideo: false });
+    await pc.setLocalDescription(offer);
+    await waitForIceGatheringComplete(pc);
+
+    ws.onmessage = async (msg) => {
+      const data = JSON.parse(msg.data);
+      if (data.type === "answer" && data.sdp) {
+        await pc.setRemoteDescription({ type: "answer", sdp: data.sdp });
+      }
+      // (Server is non-trickle; ignore any separate ICE messages.)
+    };
+
+    ws.onopen = () => {
+      ws.send(JSON.stringify({ type: "offer", sdp: pc.localDescription.sdp }));
+      setStatus("Connecting…", true);
+    };
+  }
+
+  async function disconnect() {
+    try { ws && ws.close(); } catch {}
+    cleanup();
+    setListeningUI(false);
+    setStatus("Offline", false);
+    addBubble({ text: phrases.bye, who: "ai" });
+  }
+
+  function cleanup() {
+    stopStats();
+    if (pc) { try { pc.getSenders().forEach(s => s.track && s.track.stop()); } catch {} try { pc.close(); } catch {} }
+    if (localStream) { try { localStream.getTracks().forEach(t => t.stop()); } catch {} }
+    pc = null; localStream = null; ws = null;
+  }
+
+  function waitForIceGatheringComplete(pc) {
+    return new Promise(resolve => {
+      if (pc.iceGatheringState === "complete") return resolve();
+      const check = () => {
+        if (pc.iceGatheringState === "complete") {
+          pc.removeEventListener("icegatheringstatechange", check);
+          resolve();
+        }
+      };
+      pc.addEventListener("icegatheringstatechange", check);
+    });
+  }
+
+  // ======== Simple stats (bitrate / RTT badge) ========
+  function startStats() {
+    if (statsTimer) return;
+    statsTimer = setInterval(async () => {
+      if (!pc) return;
+      try {
+        const stats = await pc.getStats();
+        let rtt, br;
+        stats.forEach(report => {
+          if (report.type === "remote-inbound-rtp" && report.kind === "audio") {
+            rtt = report.roundTripTime;
+          }
+          if (report.type === "outbound-rtp" && report.kind === "audio") {
+            br = report.bitrateMean || report.bytesSent; // rough indicator
+          }
+        });
+        // You can surface RTT/bitrate to UI if you add a badge; keeping it quiet for now.
+        // console.log("RTT", rtt, "bitrate", br);
+      } catch {}
+    }, 1500);
+  }
+  function stopStats() { if (statsTimer) { clearInterval(statsTimer); statsTimer = null; } }
+
+  // ======== UI wiring ========
+  micBtn?.addEventListener("click", async () => {
+    if (!connected) {
+      addBubble({ text: "تمام، لحظة بس…", who: "ai" });
+      await connect();
+    } else {
+      await disconnect();
+    }
+  });
+
+  endBtn?.addEventListener("click", async () => {
+    await disconnect();
+  });
+
+  // Optional: greet once at load (visual only)
+  setTimeout(() => addBubble({ text: phrases.greet, who: "ai" }), 300);
+
+})();
+</script>
+
+</body></html>

@@ -16,10 +16,47 @@ import asyncio
 from Ai_engine import LLM_Client, AzureTTSTrack
 from prompts import SYSTEM_PROMPT, TTS_INSTRUCTIONS
 
+##New:
+# --- at top of client.py ---
+import asyncio
+import numpy as np
+from config_rtc import WEBRTC_ENABLED, ASR_SAMPLE_RATE, WEBRTC_AUDIO_RATE, OPUS_BITRATE, OPUS_PTIME_MS
+from audio_resample import resample_f32_mono, float32_to_int16
+from webrtc_endpoint import WebRTCEndpoint
+from signaling_bridge import SignalingServer
+
 # Initialize the LLM client with a system prompt
 track = AzureTTSTrack()
+
+
 llm_client = LLM_Client(system_prompt=SYSTEM_PROMPT)
 
+class VoiceSession:
+    def __init__(self, uid, language="en", voice="coral", uplink_send=None):
+        self.uid = uid
+        self.language = language
+        self.voice = voice
+        self._uplink_send = uplink_send  # <-- add this
+
+        self.track = AzureTTSTrack()
+        self.rtc = WebRTCEndpoint(on_uplink_frame=self._on_uplink_audio)
+        self.track.on_pcm_f32 = self._push_tts_audio
+
+    async def _on_uplink_audio(self, f32_48k):
+        """Browser mic → 48k float → resample to 16k → forward to Whisper WS"""
+        s16_16k = float32_to_int16(
+            resample_f32_mono(f32_48k, 48000, 16000)
+            ).tobytes()
+        if self._uplink_send:
+            self._uplink_send(s16_16k)   # <-- use the callable
+    
+    async def _push_tts_audio(self, f32_48k):
+        """TTS PCM → WebRTC downlink"""
+        await self.rtc.send_tts_pcm_f32_48k(f32_48k)
+
+    async def close(self):
+        await self.rtc.close()
+        # any other cleanup
 
 class Client:
     """
@@ -97,6 +134,15 @@ class Client:
         self.transcription_callback = transcription_callback
         self.current_text = "" # New
         self.paused = False # New
+        #New:
+        self.rtc = None
+        self.signaling = None
+        self.voice_session = VoiceSession(
+            uid=self.uid,
+            language=self.language,
+            uplink_send=self.send_packet_to_server,   # <-- pass the callable
+        )
+
 
         # Translation-specific attributes
         self.enable_translation = enable_translation
@@ -127,6 +173,9 @@ class Client:
 
         Client.INSTANCES[self.uid] = self
 
+        if WEBRTC_ENABLED:
+            self._start_webrtc_services()
+
         # start websocket client in a thread
         self.ws_thread = threading.Thread(target=self.client_socket.run_forever)
         self.ws_thread.daemon = True
@@ -135,6 +184,33 @@ class Client:
         self.transcript = []
         self.translated_transcript = []
         print("[INFO]: * recording")
+
+    # NEW
+    def _start_webrtc_services(self):
+        session_rtc = self.voice_session.rtc  # use the session's PC
+
+        async def on_offer(sdp: str):
+            # set remote, create+set local answer
+            answer_sdp = await session_rtc.create_answer(sdp)
+
+            # Wait for ICE gathering to complete (non-trickle)
+            async def wait_ice_complete(pc):
+                while pc.iceGatheringState != "complete":
+                    await asyncio.sleep(0.05)
+            await wait_ice_complete(session_rtc.pc)
+
+            return session_rtc.pc.localDescription.sdp  # send final SDP with all candidates
+
+        async def on_ice_from_client(_cand):
+            # Non-trickle mode: ignore separate ICE messages (or leave handler as no-op)
+            return
+
+        async def on_ws_ready(_ws):
+            print("[SIGNALING] WS ready for browser")
+
+        self.signaling = SignalingServer(on_offer, on_ice_from_client, on_ws_ready=on_ws_ready, logger=print)
+        threading.Thread(target=self.signaling.run, daemon=True).start()
+
 
     def handle_status_messages(self, message_data):
         """Handles server status messages."""
@@ -252,7 +328,7 @@ class Client:
                 print(f"\n\n[AI]: {response}\n\n") # New
                 if response.strip(): # New
                     print("[AI]: Generating speech...") # New
-                    asyncio.run(llm_client.stream_tts(response, track, TTS_INSTRUCTIONS)) # New
+                    asyncio.run(llm_client.stream_tts(response, self.voice_session.track, TTS_INSTRUCTIONS)) # New
 
             self.current_text = "" # New
             self.paused = False # New
@@ -266,6 +342,12 @@ class Client:
         print(f"[INFO]: Websocket connection closed: {close_status_code}: {close_msg}")
         self.recording = False
         self.waiting = False
+        # NEW: close session RTC
+        try:
+            asyncio.run(self.voice_session.close())
+        except Exception as e:
+            print(f"[WARN] error closing voice session: {e}")
+
 
     def on_open(self, ws):
         """

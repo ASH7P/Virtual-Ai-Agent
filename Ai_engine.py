@@ -8,6 +8,11 @@ from aiortc import MediaStreamTrack
 from av.audio.frame import AudioFrame
 import sounddevice as sd  # NEW: play PCM to local speakers
 
+#New:
+from config_rtc import WEBRTC_AUDIO_RATE
+from audio_resample import resample_f32_mono
+import numpy as np
+
 
 # ---------------------------
 # WebRTC track placeholder (unchanged, but unused for speaker demo)
@@ -53,6 +58,15 @@ class LLM_Client:
 
         # Persist conversation history
         self.history = [{"role": "system", "content": system_prompt}]
+
+        self.on_pcm_f32 = None  # set by client.py to push into WebRTC
+
+    async def handle_tts_chunk(self, pcm_bytes_24k_le: bytes):
+        # Example if Azure returns 24 kHz s16 mono PCM:
+        arr = np.frombuffer(pcm_bytes_24k_le, dtype="<i2").astype(np.float32) / 32768.0
+        f32_48k = resample_f32_mono(arr, 24000, WEBRTC_AUDIO_RATE)
+        if self.on_pcm_f32:
+            await self.on_pcm_f32(f32_48k)
 
     def generate_reply(self, user_input: str) -> str:
         self.history.append({"role": "user", "content": user_input})
