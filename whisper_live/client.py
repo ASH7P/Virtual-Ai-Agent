@@ -31,27 +31,38 @@ track = AzureTTSTrack()
 
 llm_client = LLM_Client(system_prompt=SYSTEM_PROMPT)
 
+CHUNK_16K = 4096  # what the Whisper server expects per packet
+
 class VoiceSession:
-    def __init__(self, uid, language="en", voice="coral", uplink_send=None):
+    def __init__(self, uid, language="en", voice="onyx", uplink_send=None):
         self.uid = uid
         self.language = language
         self.voice = voice
-        self._uplink_send = uplink_send  # <-- add this
+        self._uplink_send = uplink_send
+        self._uplink_buf = np.empty(0, dtype=np.float32)   # <-- ADD a buffer
 
         self.track = AzureTTSTrack()
         self.rtc = WebRTCEndpoint(on_uplink_frame=self._on_uplink_audio)
         self.track.on_pcm_f32 = self._push_tts_audio
 
-    async def _on_uplink_audio(self, f32_48k):
-        """Browser mic → 48k float → resample to 16k → forward to Whisper WS"""
-        s16_16k = float32_to_int16(
-            resample_f32_mono(f32_48k, 48000, 16000)
-            ).tobytes()
-        if self._uplink_send:
-            self._uplink_send(s16_16k)   # <-- use the callable
-    
-    async def _push_tts_audio(self, f32_48k):
-        """TTS PCM → WebRTC downlink"""
+    async def _on_uplink_audio(self, f32_48k: np.ndarray):
+        # 1) resample 48k -> 16k, keep as float32
+        f32_16k = resample_f32_mono(f32_48k, 48000, 16000)
+        if f32_16k is None or f32_16k.size == 0:
+            return
+
+        # 2) append to buffer
+        self._uplink_buf = np.concatenate((self._uplink_buf, f32_16k))
+
+        # 3) send in 4096-sample float32 chunks
+        while self._uplink_buf.size >= CHUNK_16K:
+            chunk = self._uplink_buf[:CHUNK_16K]
+            self._uplink_buf = self._uplink_buf[CHUNK_16K:]
+            if self._uplink_send:
+                # IMPORTANT: send as float32 little-endian bytes
+                self._uplink_send(chunk.astype("<f4").tobytes())
+
+    async def _push_tts_audio(self, f32_48k: np.ndarray):
         await self.rtc.send_tts_pcm_f32_48k(f32_48k)
 
     async def close(self):
