@@ -82,6 +82,20 @@ class WebRTCEndpoint:
         self._tts_track = _TTSSourceTrack(rate=WEBRTC_AUDIO_RATE)
         self.pc.addTrack(self._tts_track)
 
+        # in WebRTCEndpoint.__init__ after addTrack(self._tts_track)
+        asyncio.create_task(self._prime_downlink())
+
+        async def _prime_downlink(self):
+            import numpy as np, math
+            # 100ms silence
+            await self._tts_track.push_f32_mono_48k(np.zeros(int(WEBRTC_AUDIO_RATE*0.1), np.float32))
+            # 1s 440Hz @ -14 dBFS
+            t = np.arange(int(WEBRTC_AUDIO_RATE*1.0), dtype=np.float32)
+            beep = 0.2*np.sin(2*math.pi*440*t/WEBRTC_AUDIO_RATE)
+            await self._tts_track.push_f32_mono_48k(beep)
+            self._logger("[RTC] downlink primed with 1s beep")
+
+
         @self.pc.on("track")
         def on_track(track):
             if track.kind != "audio":
