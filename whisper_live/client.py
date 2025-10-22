@@ -147,12 +147,7 @@ class Client:
         #New:
         self.rtc = None
         self.signaling = None
-        self.voice_session = VoiceSession(
-            uid=self.uid,
-            language=self.language,
-            uplink_send=self.send_packet_to_server,   # <-- pass the callable
-        )
-
+        self.voice_session = None
 
         # Translation-specific attributes
         self.enable_translation = enable_translation
@@ -197,29 +192,30 @@ class Client:
 
     # NEW
     def _start_webrtc_services(self):
-        session_rtc = self.voice_session.rtc  # use the session's PC
-
         async def on_offer(sdp: str):
-            # set remote, create+set local answer
-            answer_sdp = await session_rtc.create_answer(sdp)
-
-            # Wait for ICE gathering to complete (non-trickle)
-            async def wait_ice_complete(pc):
-                while pc.iceGatheringState != "complete":
-                    await asyncio.sleep(0.05)
-            await wait_ice_complete(session_rtc.pc)
-
-            return session_rtc.pc.localDescription.sdp  # send final SDP with all candidates
+            # Ensure VoiceSession exists (created in on_ws_ready)
+            if self.voice_session is None:
+                raise RuntimeError("VoiceSession not ready")
+            # This runs on the signaling loop; WebRTCEndpoint was created on same loop.
+            answer_sdp = await self.voice_session.rtc.create_answer(sdp)
+            return answer_sdp  # already contains ICE candidates (server waits internally)
 
         async def on_ice_from_client(_cand):
-            # Non-trickle mode: ignore separate ICE messages (or leave handler as no-op)
+            # Non-trickle mode: ignore
             return
 
         async def on_ws_ready(_ws):
             print("[SIGNALING] WS ready for browser")
+            # Create VoiceSession on the signaling loop so aiortc binds to this loop
+            self.voice_session = VoiceSession(
+                uid=self.uid,
+                language=self.language,
+                uplink_send=self.send_packet_to_server,
+            )
 
         self.signaling = SignalingServer(on_offer, on_ice_from_client, on_ws_ready=on_ws_ready, logger=print)
         threading.Thread(target=self.signaling.run, daemon=True).start()
+
 
 
     def handle_status_messages(self, message_data):
@@ -354,7 +350,10 @@ class Client:
         self.waiting = False
         # NEW: close session RTC
         try:
-            asyncio.run(self.voice_session.close())
+            if self.voice_session and getattr(self.signaling, "loop", None):
+                fut = asyncio.run_coroutine_threadsafe(self.voice_session.close(), self.signaling.loop)
+                fut.result(timeout=5)
+                self.voice_session = None
         except Exception as e:
             print(f"[WARN] error closing voice session: {e}")
 

@@ -24,6 +24,7 @@ class AzureTTSTrack(MediaStreamTrack):
         super().__init__()
         self.queue = asyncio.Queue()
         self.sample_rate = sample_rate
+        self.on_pcm_f32 = None  # to be set by LLM_Client
 
     async def recv(self) -> AudioFrame:
         pcm_bytes = await self.queue.get()

@@ -44,6 +44,7 @@ class SignalingServer:
     def run(self):
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
+        self.loop = loop
 
         app = web.Application()
         app.router.add_get("/ws", self._ws_handler)
